@@ -1,0 +1,24 @@
+{
+  "name": "bizswipe-backend",
+  "version": "2.0.0",
+  "description": "BizSwipe Production Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev":   "nodemon server.js"
+  },
+  "dependencies": {
+    "@fastify/cors":       "^9.0.0",
+    "@fastify/helmet":     "^11.0.0",
+    "@fastify/rate-limit": "^9.0.0",
+    "fastify":             "^4.28.0",
+    "firebase-admin":      "^12.0.0",
+    "node-fetch":          "^3.3.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
