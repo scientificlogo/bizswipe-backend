@@ -5,7 +5,7 @@ const { FieldValue }     = require('firebase-admin/firestore');
 
 module.exports = async (fastify) => {
 
-  // Create listing — status: pending_approval (admin review required)
+  // Create listing — status: active (directly live for beta)
   fastify.post('/create', { preHandler: verifyToken }, async (req, reply) => {
     const { uid } = req.user;
     const data    = req.body;
@@ -19,7 +19,7 @@ module.exports = async (fastify) => {
     // Check if seller already has a listing (any status)
     const existing = await db.collection('listings')
       .where('sellerId','==',uid)
-      .where('status','in',['active','pending_approval'])
+      .where('status','in',['active'])
       .limit(1).get();
     if (!existing.empty) {
       return reply.code(409).send({
@@ -39,7 +39,7 @@ module.exports = async (fastify) => {
       sellerId:    uid,
       sellerName:  seller.name  || 'Seller',
       sellerPhone: seller.phone || '',
-      status:      'pending_approval',  // ← Admin review required
+      status:      'active',  // 
       interested:  0,
       views:       0,
       createdAt:   FieldValue.serverTimestamp(),
@@ -66,8 +66,8 @@ module.exports = async (fastify) => {
     return reply.send({
       success:   true,
       listingId: docRef.id,
-      status:    'pending_approval',
-      message:   'Listing submitted for review. Goes live within 24 hours.',
+      status:    'active',
+      message:   'Listing is now live on BizSwipe!',
     });
   });
 
