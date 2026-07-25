@@ -1,157 +1,181 @@
-const { verifyToken } = require('../middleware/auth');
-const { db }          = require('../config/firebase');
-const { FieldValue }  = require('firebase-admin/firestore');
+'use strict';
 
-// ── Admin check middleware ─────────────────────────────────────────────────────
-const verifyAdmin = async (req, reply) => {
-  await verifyToken(req, reply);
-  const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').filter(Boolean);
-  if (!ADMIN_UIDS.includes(req.user?.uid)) {
-    return reply.code(403).send({ success:false, error:'Admin access required' });
-  }
-};
+const { verifyAdmin }  = require('../middleware/auth');
+const { db }           = require('../config/firebase');
+const { FieldValue }   = require('firebase-admin/firestore');
+const { notifyUser }   = require('../utils/pushNotification');
+const { rejectListing: rejectSchema, banUser: banSchema } = require('../schemas');
 
-// ─────────────────────────────────────────────────────────────────────────────
 module.exports = async (fastify) => {
 
-  // ── GET pending listings ──────────────────────────────────────────────────
-  fastify.get('/listings/pending', { preHandler: verifyAdmin }, async (req, reply) => {
-    const snap = await db.collection('listings')
-      .where('status','==','pending_approval')
-      .orderBy('createdAt','asc')
-      .get();
+  // ── Dashboard stats ────────────────────────────────────────────────────────
+  fastify.get('/stats', { preHandler: verifyAdmin }, async (req, reply) => {
+    const [users, activeListings, pendingListings, matches, reports, violations] =
+      await Promise.all([
+        db.collection('users').count().get(),
+        db.collection('listings').where('status','==','active').count().get(),
+        db.collection('listings').where('status','==','pending_approval').count().get(),
+        db.collection('matches').count().get(),
+        db.collection('reports').count().get(),
+        db.collection('violations').count().get(),
+      ]);
+
+    req.log.info({ adminId: req.user.uid, requestId: req.id }, 'Admin stats fetched');
+
     return reply.send({
       success: true,
-      count: snap.docs.length,
-      listings: snap.docs.map(d => ({ id:d.id, ...d.data() })),
+      stats: {
+        totalUsers:       users.data().count,
+        activeListings:   activeListings.data().count,
+        pendingListings:  pendingListings.data().count,
+        totalMatches:     matches.data().count,
+        totalReports:     reports.data().count,
+        totalViolations:  violations.data().count,
+      },
     });
   });
 
-  // ── APPROVE listing ───────────────────────────────────────────────────────
-  fastify.post('/listings/:listingId/approve', { preHandler: verifyAdmin }, async (req, reply) => {
-    const { listingId } = req.params;
-    const listingRef = db.collection('listings').doc(listingId);
-    const listing = await listingRef.get();
-    if (!listing.exists) return reply.code(404).send({ success:false, error:'Listing not found' });
+  // ── Pending listings ───────────────────────────────────────────────────────
+  fastify.get('/listings/pending', { preHandler: verifyAdmin }, async (req, reply) => {
+    const snap = await db.collection('listings')
+      .where('status','==','pending_approval')
+      .orderBy('createdAt','asc').get();
+    return reply.send({
+      success:  true,
+      count:    snap.docs.length,
+      listings: snap.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  });
 
-    await listingRef.update({
+  // ── Approve listing ────────────────────────────────────────────────────────
+  fastify.post('/listings/:listingId/approve', {
+    preHandler: verifyAdmin,
+  }, async (req, reply) => {
+    const { listingId } = req.params;
+    const ref           = db.collection('listings').doc(listingId);
+    const doc           = await ref.get();
+
+    if (!doc.exists) {
+      return reply.code(404).send({ success: false, error: 'Listing not found', requestId: req.id });
+    }
+
+    await ref.update({
       status:     'active',
       approvedAt: FieldValue.serverTimestamp(),
       approvedBy: req.user.uid,
     });
 
-    // Notify seller
-    const sellerDoc = await db.collection('users').doc(listing.data().sellerId).get();
-    const pushToken = sellerDoc.data()?.pushToken;
-    if (pushToken) {
-      await sendExpoPush(
-        pushToken,
-        'Listing Approved!',
-        'Your business listing is now live on BizSwipe.',
-        { type:'listing_approved', listingId }
-      );
-    }
+    req.log.info({ adminId: req.user.uid, listingId, requestId: req.id }, 'Listing approved');
 
-    return reply.send({ success:true, message:'Listing approved and live!' });
+    // Notify seller
+    await notifyUser(db, doc.data().sellerId,
+      'Listing Approved!',
+      'Your business listing is now live on BizSwipe.',
+      { type: 'listing_approved', listingId }
+    );
+
+    return reply.send({ success: true, message: 'Listing approved and live!' });
   });
 
-  // ── REJECT listing ────────────────────────────────────────────────────────
-  fastify.post('/listings/:listingId/reject', { preHandler: verifyAdmin }, async (req, reply) => {
-    const { listingId } = req.params;
-    const { reason } = req.body;
-    const listingRef = db.collection('listings').doc(listingId);
-    const listing = await listingRef.get();
-    if (!listing.exists) return reply.code(404).send({ success:false, error:'Listing not found' });
+  // ── Reject listing ─────────────────────────────────────────────────────────
+  fastify.post('/listings/:listingId/reject', {
+    preHandler: verifyAdmin,
+    schema:     rejectSchema,
+  }, async (req, reply) => {
+    const { listingId }   = req.params;
+    const { reason = 'Does not meet platform guidelines' } = req.body;
+    const ref             = db.collection('listings').doc(listingId);
+    const doc             = await ref.get();
 
-    await listingRef.update({
-      status:     'rejected',
-      rejectedAt: FieldValue.serverTimestamp(),
-      rejectedBy: req.user.uid,
-      rejectReason: reason || 'Does not meet platform guidelines',
+    if (!doc.exists) {
+      return reply.code(404).send({ success: false, error: 'Listing not found', requestId: req.id });
+    }
+
+    await ref.update({
+      status:       'rejected',
+      rejectedAt:   FieldValue.serverTimestamp(),
+      rejectedBy:   req.user.uid,
+      rejectReason: reason,
     });
 
-    // Notify seller
-    const sellerDoc = await db.collection('users').doc(listing.data().sellerId).get();
-    const pushToken = sellerDoc.data()?.pushToken;
-    if (pushToken) {
-      await sendExpoPush(
-        pushToken,
-        'Listing Needs Changes',
-        reason || 'Your listing needs to be updated before it can go live.',
-        { type:'listing_rejected', listingId }
-      );
-    }
+    req.log.info({ adminId: req.user.uid, listingId, reason, requestId: req.id }, 'Listing rejected');
 
-    return reply.send({ success:true, message:'Listing rejected' });
+    // Notify seller
+    await notifyUser(db, doc.data().sellerId,
+      'Listing Needs Changes',
+      reason,
+      { type: 'listing_rejected', listingId }
+    );
+
+    return reply.send({ success: true, message: 'Listing rejected' });
   });
 
-  // ── GET all reports ───────────────────────────────────────────────────────
+  // ── All reports ────────────────────────────────────────────────────────────
   fastify.get('/reports', { preHandler: verifyAdmin }, async (req, reply) => {
     const snap = await db.collection('reports')
       .orderBy('createdAt','desc').limit(100).get();
     return reply.send({
       success: true,
-      count: snap.docs.length,
-      reports: snap.docs.map(d => ({ id:d.id, ...d.data() })),
+      count:   snap.docs.length,
+      reports: snap.docs.map(d => ({ id: d.id, ...d.data() })),
     });
   });
 
-  // ── GET violations (contact info attempts) ────────────────────────────────
+  // ── All violations ─────────────────────────────────────────────────────────
   fastify.get('/violations', { preHandler: verifyAdmin }, async (req, reply) => {
     const snap = await db.collection('violations')
       .orderBy('createdAt','desc').limit(100).get();
     return reply.send({
-      success: true,
-      count: snap.docs.length,
-      violations: snap.docs.map(d => ({ id:d.id, ...d.data() })),
+      success:    true,
+      count:      snap.docs.length,
+      violations: snap.docs.map(d => ({ id: d.id, ...d.data() })),
     });
   });
 
-  // ── GET dashboard stats ───────────────────────────────────────────────────
-  fastify.get('/stats', { preHandler: verifyAdmin }, async (req, reply) => {
-    const [users, listings, matches, reports, violations] = await Promise.all([
-      db.collection('users').count().get(),
-      db.collection('listings').where('status','==','active').count().get(),
-      db.collection('matches').count().get(),
-      db.collection('reports').count().get(),
-      db.collection('violations').count().get(),
-    ]);
-    return reply.send({
-      success: true,
-      stats: {
-        totalUsers:      users.data().count,
-        activeListings:  listings.data().count,
-        totalMatches:    matches.data().count,
-        totalReports:    reports.data().count,
-        totalViolations: violations.data().count,
-      },
-    });
-  });
-
-  // ── BAN user ──────────────────────────────────────────────────────────────
-  fastify.post('/users/:userId/ban', { preHandler: verifyAdmin }, async (req, reply) => {
+  // ── Ban user ───────────────────────────────────────────────────────────────
+  fastify.post('/users/:userId/ban', {
+    preHandler: verifyAdmin,
+    schema:     banSchema,
+  }, async (req, reply) => {
     const { userId } = req.params;
-    const { reason } = req.body;
+    const { reason = 'Violation of platform policies' } = req.body;
+
     await db.collection('users').doc(userId).update({
-      banned: true,
-      bannedAt: FieldValue.serverTimestamp(),
-      bannedBy: req.user.uid,
-      banReason: reason || 'Violation of platform policies',
+      banned:    true,
+      bannedAt:  FieldValue.serverTimestamp(),
+      bannedBy:  req.user.uid,
+      banReason: reason,
     });
+
     // Deactivate all their listings
     const listings = await db.collection('listings').where('sellerId','==',userId).get();
-    const batch = db.batch();
-    listings.docs.forEach(d => batch.update(d.ref, { status:'suspended' }));
-    await batch.commit();
-    return reply.send({ success:true, message:'User banned and listings suspended' });
-  });
-};
+    if (!listings.empty) {
+      const batch = db.batch();
+      listings.docs.forEach(d => batch.update(d.ref, { status: 'suspended' }));
+      await batch.commit();
+    }
 
-const sendExpoPush = async (token, title, body, data={}) => {
-  try {
-    await fetch('https://exp.host/--/api/v2/push/send', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ to:token, sound:'default', title, body, data, priority:'high' }),
+    req.log.info({ adminId: req.user.uid, userId, reason, requestId: req.id }, 'User banned');
+
+    return reply.send({ success: true, message: 'User banned and listings suspended' });
+  });
+
+  // ── Get all users (for admin management) ──────────────────────────────────
+  fastify.get('/users', { preHandler: verifyAdmin }, async (req, reply) => {
+    const snap = await db.collection('users')
+      .orderBy('createdAt', 'desc').limit(100).get();
+    return reply.send({
+      success: true,
+      count:   snap.docs.length,
+      users:   snap.docs.map(d => ({
+        id:    d.id,
+        name:  d.data().name,
+        phone: d.data().phone,
+        role:  d.data().role,
+        banned: d.data().banned || false,
+        gstVerified: d.data().gstVerified || false,
+        createdAt: d.data().createdAt,
+      })),
     });
-  } catch(e) { console.log('Push error:', e.message); }
+  });
 };

@@ -1,8 +1,12 @@
-const { verifyToken } = require('../middleware/auth');
-const { db }          = require('../config/firebase');
-const { FieldValue }  = require('firebase-admin/firestore');
+'use strict';
 
-// ── Server-side Contact Detection ─────────────────────────────────────────────
+const { verifyToken }          = require('../middleware/auth');
+const { db }                   = require('../config/firebase');
+const { FieldValue }           = require('firebase-admin/firestore');
+const { BlockedContentError, NotFoundError, ForbiddenError } = require('../utils/errors');
+const { sendMessage: msgSchema } = require('../schemas');
+
+// ── Contact Detection ─────────────────────────────────────────────────────────
 const WORD_TO_DIGIT = {
   'zero':'0','one':'1','two':'2','three':'3','four':'4','five':'5',
   'six':'6','seven':'7','eight':'8','nine':'9',
@@ -13,7 +17,7 @@ const WORD_TO_DIGIT = {
 const convertWordsToDigits = (text) => {
   let c = text.toLowerCase();
   Object.entries(WORD_TO_DIGIT).forEach(([w,d]) => {
-    c = c.replace(new RegExp(`\\b${w}\\b`,'gi'), d);
+    c = c.replace(new RegExp(`\\b${w}\\b`, 'gi'), d);
   });
   return c;
 };
@@ -21,18 +25,18 @@ const convertWordsToDigits = (text) => {
 const countNumberWords = (text) => {
   let count = 0;
   Object.keys(WORD_TO_DIGIT).forEach(w => {
-    const m = text.toLowerCase().match(new RegExp(`\\b${w}\\b`,'gi'));
+    const m = text.toLowerCase().match(new RegExp(`\\b${w}\\b`, 'gi'));
     if (m) count += m.length;
   });
   return count;
 };
 
 const CONTACT_PATTERNS = [
-  { pattern:/(\+91[\s\-,]*)?[6-9][\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d/, label:'phone number' },
-  { pattern:/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/, label:'email address' },
-  { pattern:/whatsapp|wtsapp|wa\.me|on wa\b/i, label:'WhatsApp contact' },
-  { pattern:/telegram|t\.me\//i, label:'Telegram contact' },
-  { pattern:/\bcall me\b|\bping me\b|\bcontact me\b|\breach me\b|\bmy number\b|\bmy email\b|\bpe call\b|\bkaro call\b/i, label:'off-platform contact' },
+  { pattern: /(\+91[\s\-,]*)?[6-9][\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d[\s\-,]?\d/, label: 'phone number' },
+  { pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,    label: 'email address' },
+  { pattern: /whatsapp|wtsapp|wa\.me/i,                              label: 'WhatsApp contact' },
+  { pattern: /telegram|t\.me\//i,                                    label: 'Telegram contact' },
+  { pattern: /\bcall me\b|\bping me\b|\bmy number\b|\bmy email\b/i, label: 'off-platform contact' },
 ];
 
 const detectContactInfo = (text) => {
@@ -48,45 +52,52 @@ const detectContactInfo = (text) => {
 // ─────────────────────────────────────────────────────────────────────────────
 module.exports = async (fastify) => {
 
-  // Send message — server validates contact info before saving
-  fastify.post('/send', { preHandler: verifyToken }, async (req, reply) => {
-    const { uid } = req.user;
+  // ── Send message (server-side contact detection + auth check) ─────────────
+  fastify.post('/send', {
+    preHandler: verifyToken,
+    schema:     msgSchema,
+    config:     { rateLimit: { max: 30, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
+    const { uid }                     = req.user;
     const { matchId, text, senderName } = req.body;
 
-    if (!matchId) return reply.code(400).send({ success:false, error:'matchId required' });
-    if (!text?.trim()) return reply.code(400).send({ success:false, error:'Message empty' });
-    if (text.length > 500) return reply.code(400).send({ success:false, error:'Message too long (max 500)' });
-
-    // ── Server-side contact detection ─────────────────────────────────────
+    // Contact info detection
     const detected = detectContactInfo(text.trim());
     if (detected) {
-      // Log the attempt
-      console.log(`[BLOCKED] User ${uid} tried to send ${detected} in match ${matchId}`);
-      // Save flagged message to violations log
-      await db.collection('violations').add({
-        userId: uid, matchId,
-        type: 'contact_info_attempt',
-        detected, text: text.trim(),
-        createdAt: FieldValue.serverTimestamp(),
-      });
-      return reply.code(422).send({
-        success: false,
-        error: `Message blocked: contains ${detected}. Keep conversations on BizSwipe.`,
-        blocked: true,
+      req.log.warn({ userId: uid, matchId, detected, requestId: req.id }, 'Contact info blocked');
+
+      // Log violation
+      db.collection('violations').add({
+        userId:    uid,
+        matchId,
+        type:      'contact_info_attempt',
         detected,
+        text:      text.trim().substring(0, 200), // truncate for storage
+        createdAt: FieldValue.serverTimestamp(),
+      }).catch(() => {});
+
+      return reply.code(422).send({
+        success:   false,
+        blocked:   true,
+        detected,
+        error:     `Message blocked: contains ${detected}. Keep all conversations on BizSwipe platform.`,
+        requestId: req.id,
       });
     }
 
-    // ── Verify user is part of this match ─────────────────────────────────
+    // Verify match exists + user is part of it
     const matchDoc = await db.collection('matches').doc(matchId).get();
-    if (!matchDoc.exists) return reply.code(404).send({ success:false, error:'Match not found' });
+    if (!matchDoc.exists) {
+      return reply.code(404).send({ success: false, error: 'Match not found', requestId: req.id });
+    }
 
     const match = matchDoc.data();
     if (match.buyerId !== uid && match.sellerId !== uid) {
-      return reply.code(403).send({ success:false, error:'Unauthorized' });
+      req.log.warn({ userId: uid, matchId, requestId: req.id }, 'Unauthorized message attempt');
+      return reply.code(403).send({ success: false, error: 'Not authorized', requestId: req.id });
     }
 
-    // ── Save message ──────────────────────────────────────────────────────
+    // Save message to Firestore
     const msgRef = await db.collection('messages').add({
       matchId,
       senderId:   uid,
@@ -96,20 +107,21 @@ module.exports = async (fastify) => {
       createdAt:  FieldValue.serverTimestamp(),
     });
 
-    return reply.send({ success:true, messageId: msgRef.id });
+    req.log.info({ userId: uid, matchId, messageId: msgRef.id, requestId: req.id }, 'Message sent');
+
+    return reply.send({ success: true, messageId: msgRef.id });
   });
 
-  // Get violations log (admin only)
-  fastify.get('/violations', { preHandler: verifyToken }, async (req, reply) => {
-    const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').filter(Boolean);
-    if (!ADMIN_UIDS.includes(req.user.uid)) {
-      return reply.code(403).send({ success:false, error:'Admin only' });
-    }
+  // ── Get violations (admin only) ───────────────────────────────────────────
+  fastify.get('/violations', {
+    preHandler: require('../middleware/auth').verifyAdmin,
+  }, async (req, reply) => {
     const snap = await db.collection('violations')
-      .orderBy('createdAt','desc').limit(50).get();
+      .orderBy('createdAt', 'desc').limit(100).get();
     return reply.send({
-      success: true,
-      violations: snap.docs.map(d => ({ id:d.id, ...d.data() })),
+      success:    true,
+      count:      snap.docs.length,
+      violations: snap.docs.map(d => ({ id: d.id, ...d.data() })),
     });
   });
 };

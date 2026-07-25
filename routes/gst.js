@@ -1,69 +1,73 @@
-const GST_REGEX = /^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[A-Z][0-9A-Z]{1}$/;
+'use strict';
 
-const TEST_DATA = {
-  '27AABCU9603R1ZP': { businessName:'TEST COMPANY PRIVATE LIMITED', status:'Active', businessType:'Private Limited', state:'Maharashtra', city:'Mumbai', registrationDate:'01/01/2020' },
-  '27AABCS1429B1Z6': { businessName:'DEMO BUSINESS SOLUTIONS LLP',   status:'Active', businessType:'LLP',             state:'Maharashtra', city:'Pune',   registrationDate:'15/03/2019' },
-  '29AABCU9603R1ZN': { businessName:'SAMPLE MANUFACTURING CO PVT LTD',status:'Active', businessType:'Private Limited', state:'Karnataka',   city:'Bangalore', registrationDate:'20/06/2018' },
-};
+const { verifyToken }  = require('../middleware/auth');
+const { verifyGST: verifyGSTSchema } = require('../schemas');
 
-const rateMap = new Map();
-const isLimited = (ip) => {
-  const now = Date.now();
-  const list = (rateMap.get(ip)||[]).filter(t=>now-t<60000);
-  if (list.length>=10) return true;
-  list.push(now); rateMap.set(ip,list); return false;
+const RAPIDAPI_KEY  = process.env.RAPIDAPI_KEY;
+const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST;
+
+// Test GST numbers for development
+const TEST_GSTIN = {
+  '27AABCU9603R1ZP': { businessName:'Demo Company Pvt Ltd',    state:'Maharashtra', status:'Active', isTestMode:true },
+  '27AABCS1429B1Z6': { businessName:'Sample LLP Pune',          state:'Maharashtra', status:'Active', isTestMode:true },
+  '29AABCU9603R1ZN': { businessName:'Test Bangalore Company',   state:'Karnataka',   status:'Active', isTestMode:true },
 };
-setInterval(()=>rateMap.clear(), 5*60*1000);
 
 module.exports = async (fastify) => {
-  fastify.post('/gst', async (req, reply) => {
-    const ip = req.headers['x-forwarded-for'] || req.ip;
-    if (isLimited(ip)) return reply.code(429).send({ success:false, error:'Too many requests — 1 minute baad try karo' });
 
+  fastify.post('/gst', {
+    preHandler: verifyToken,
+    schema:     verifyGSTSchema,
+    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+  }, async (req, reply) => {
     const { gstin } = req.body;
-    if (!gstin) return reply.code(400).send({ success:false, error:'GST number required' });
 
-    const clean = gstin.toUpperCase().trim();
-    if (clean.length!==15) return reply.code(400).send({ success:false, error:'GST 15 characters ka hona chahiye' });
-    if (!GST_REGEX.test(clean)) return reply.code(400).send({ success:false, error:'GST format galat hai' });
+    req.log.info({ gstin, userId: req.user.uid, requestId: req.id }, 'GST verify requested');
 
-    if (TEST_DATA[clean]) {
-      return reply.send({ success:true, isTestMode:true, gstin:clean, ...TEST_DATA[clean] });
+    // Test mode
+    if (TEST_GSTIN[gstin]) {
+      return reply.send({ success: true, ...TEST_GSTIN[gstin] });
     }
 
+    // Real API call
     try {
-      const controller = new AbortController();
-      const timeout    = setTimeout(()=>controller.abort(), 8000);
-      const res = await fetch(
-        `https://gst-verification-api-get-profile-returns-data.p.rapidapi.com/v1/gstin/${clean}/details`,
+      const response = await fetch(
+        `https://gst-verification-api-get-profile-returns-data.p.rapidapi.com/gstin/${gstin}`,
         {
+          method:  'GET',
           headers: {
-            'x-rapidapi-host': 'gst-verification-api-get-profile-returns-data.p.rapidapi.com',
-            'x-rapidapi-key':  process.env.RAPIDAPI_KEY,
+            'X-RapidAPI-Key':  RAPIDAPI_KEY,
+            'X-RapidAPI-Host': RAPIDAPI_HOST,
           },
-          signal: controller.signal,
         }
       );
-      clearTimeout(timeout);
-      const result = await res.json();
 
-      if (result.error || !result.data) return reply.send({ success:false, error:'GST valid nahi hai' });
-      const d = result.data;
-      if (d.status!=='Active') return reply.send({ success:false, error:`GST "${d.status}" hai — Active number daalo` });
+      if (!response.ok) {
+        req.log.warn({ gstin, status: response.status, requestId: req.id }, 'GST API error');
+        return reply.code(422).send({
+          success:   false,
+          error:     'GST number not found or invalid',
+          requestId: req.id,
+        });
+      }
+
+      const data = await response.json();
 
       return reply.send({
-        success: true, isTestMode: false, gstin: clean,
-        businessName:     d.trade_name || d.legal_name,
-        legalName:        d.legal_name,
-        status:           d.status,
-        businessType:     d.business_constitution,
-        state:            d.place_of_business_principal?.address?.state || '',
-        city:             d.place_of_business_principal?.address?.location || '',
-        registrationDate: d.registration_date || '',
+        success:      true,
+        businessName: data.tradeName || data.legalName || 'Business',
+        state:        data.stateName || 'India',
+        status:       data.status    || 'Active',
+        isTestMode:   false,
       });
+
     } catch (err) {
-      if (err.name==='AbortError') return reply.code(408).send({ success:false, error:'GST server slow — dobara try karo' });
-      return reply.code(500).send({ success:false, error:'Server error — dobara try karo' });
+      req.log.error({ err, gstin, requestId: req.id }, 'GST API call failed');
+      return reply.code(503).send({
+        success:   false,
+        error:     'GST verification service unavailable — try again',
+        requestId: req.id,
+      });
     }
   });
 };

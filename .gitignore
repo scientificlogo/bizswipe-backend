@@ -2,3 +2,6 @@ node_modules/
 config/serviceAccountKey.json
 .env
 *.json.bak
+.DS_Store
+**/.DS_Store
+routes/.DS_Store
