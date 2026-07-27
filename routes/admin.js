@@ -4,13 +4,14 @@ const { verifyAdmin }  = require('../middleware/auth');
 const { db }           = require('../config/firebase');
 const { FieldValue }   = require('firebase-admin/firestore');
 const { notifyUser }   = require('../utils/pushNotification');
+const { addAuditLog, addPushJob } = require('../utils/queue');
 const { rejectListing: rejectSchema, banUser: banSchema } = require('../schemas');
 
 module.exports = async (fastify) => {
 
   // ── Dashboard stats ────────────────────────────────────────────────────────
   fastify.get('/stats', { preHandler: verifyAdmin }, async (req, reply) => {
-    const [users, activeListings, pendingListings, matches, reports, violations] =
+    const [users, activeListings, pendingListings, matches, reports, violations, adminActions] =
       await Promise.all([
         db.collection('users').count().get(),
         db.collection('listings').where('status','==','active').count().get(),
@@ -18,9 +19,14 @@ module.exports = async (fastify) => {
         db.collection('matches').count().get(),
         db.collection('reports').count().get(),
         db.collection('violations').count().get(),
+        db.collection('adminActions').count().get(),
       ]);
 
-    req.log.info({ adminId: req.user.uid, requestId: req.id }, 'Admin stats fetched');
+    req.log.info({
+      event:   'admin_stats_fetched',
+      adminId: req.user.uid,
+      requestId: req.id,
+    }, 'Admin stats fetched');
 
     return reply.send({
       success: true,
@@ -31,6 +37,7 @@ module.exports = async (fastify) => {
         totalMatches:     matches.data().count,
         totalReports:     reports.data().count,
         totalViolations:  violations.data().count,
+        totalAdminActions: adminActions.data().count,
       },
     });
   });
@@ -40,6 +47,7 @@ module.exports = async (fastify) => {
     const snap = await db.collection('listings')
       .where('status','==','pending_approval')
       .orderBy('createdAt','asc').get();
+
     return reply.send({
       success:  true,
       count:    snap.docs.length,
@@ -65,11 +73,23 @@ module.exports = async (fastify) => {
       approvedBy: req.user.uid,
     });
 
-    req.log.info({ adminId: req.user.uid, listingId, requestId: req.id }, 'Listing approved');
+    req.log.info({
+      event:     'listing_approved',
+      adminId:   req.user.uid,
+      listingId,
+      requestId: req.id,
+    }, 'Listing approved');
 
-    // Notify seller
-    await notifyUser(db, doc.data().sellerId,
-      'Listing Approved!',
+    // Audit log via queue
+    addAuditLog(req.user.uid, 'listing_approved', listingId, 'listing', {
+      sellerName: doc.data().sellerName,
+      industry:   doc.data().industry,
+    });
+
+    // Notify seller via queue
+    addPushJob(
+      doc.data().sellerId,
+      'Listing Approved! 🎉',
       'Your business listing is now live on BizSwipe.',
       { type: 'listing_approved', listingId }
     );
@@ -82,10 +102,10 @@ module.exports = async (fastify) => {
     preHandler: verifyAdmin,
     schema:     rejectSchema,
   }, async (req, reply) => {
-    const { listingId }   = req.params;
+    const { listingId } = req.params;
     const { reason = 'Does not meet platform guidelines' } = req.body;
-    const ref             = db.collection('listings').doc(listingId);
-    const doc             = await ref.get();
+    const ref = db.collection('listings').doc(listingId);
+    const doc = await ref.get();
 
     if (!doc.exists) {
       return reply.code(404).send({ success: false, error: 'Listing not found', requestId: req.id });
@@ -98,10 +118,20 @@ module.exports = async (fastify) => {
       rejectReason: reason,
     });
 
-    req.log.info({ adminId: req.user.uid, listingId, reason, requestId: req.id }, 'Listing rejected');
+    req.log.info({
+      event:     'listing_rejected',
+      adminId:   req.user.uid,
+      listingId,
+      reason,
+      requestId: req.id,
+    }, 'Listing rejected');
 
-    // Notify seller
-    await notifyUser(db, doc.data().sellerId,
+    // Audit log via queue
+    addAuditLog(req.user.uid, 'listing_rejected', listingId, 'listing', { reason });
+
+    // Notify seller via queue
+    addPushJob(
+      doc.data().sellerId,
       'Listing Needs Changes',
       reason,
       { type: 'listing_rejected', listingId }
@@ -114,6 +144,7 @@ module.exports = async (fastify) => {
   fastify.get('/reports', { preHandler: verifyAdmin }, async (req, reply) => {
     const snap = await db.collection('reports')
       .orderBy('createdAt','desc').limit(100).get();
+
     return reply.send({
       success: true,
       count:   snap.docs.length,
@@ -125,10 +156,24 @@ module.exports = async (fastify) => {
   fastify.get('/violations', { preHandler: verifyAdmin }, async (req, reply) => {
     const snap = await db.collection('violations')
       .orderBy('createdAt','desc').limit(100).get();
+
     return reply.send({
       success:    true,
       count:      snap.docs.length,
       violations: snap.docs.map(d => ({ id: d.id, ...d.data() })),
+    });
+  });
+
+  // ── Admin action history ───────────────────────────────────────────────────
+  fastify.get('/actions', { preHandler: verifyAdmin }, async (req, reply) => {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    const snap  = await db.collection('adminActions')
+      .orderBy('createdAt','desc').limit(limit).get();
+
+    return reply.send({
+      success: true,
+      count:   snap.docs.length,
+      actions: snap.docs.map(d => ({ id: d.id, ...d.data() })),
     });
   });
 
@@ -139,6 +184,11 @@ module.exports = async (fastify) => {
   }, async (req, reply) => {
     const { userId } = req.params;
     const { reason = 'Violation of platform policies' } = req.body;
+
+    const userDoc = await db.collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      return reply.code(404).send({ success: false, error: 'User not found', requestId: req.id });
+    }
 
     await db.collection('users').doc(userId).update({
       banned:    true,
@@ -155,26 +205,65 @@ module.exports = async (fastify) => {
       await batch.commit();
     }
 
-    req.log.info({ adminId: req.user.uid, userId, reason, requestId: req.id }, 'User banned');
+    req.log.info({
+      event:     'user_banned',
+      adminId:   req.user.uid,
+      userId,
+      reason,
+      requestId: req.id,
+    }, 'User banned');
+
+    // Audit log via queue
+    addAuditLog(req.user.uid, 'user_banned', userId, 'user', {
+      reason,
+      userName:  userDoc.data().name,
+      userPhone: userDoc.data().phone,
+    });
 
     return reply.send({ success: true, message: 'User banned and listings suspended' });
   });
 
-  // ── Get all users (for admin management) ──────────────────────────────────
+  // ── Unban user ─────────────────────────────────────────────────────────────
+  fastify.post('/users/:userId/unban', {
+    preHandler: verifyAdmin,
+  }, async (req, reply) => {
+    const { userId } = req.params;
+
+    await db.collection('users').doc(userId).update({
+      banned:    false,
+      unbannedAt: FieldValue.serverTimestamp(),
+      unbannedBy: req.user.uid,
+    });
+
+    req.log.info({
+      event:     'user_unbanned',
+      adminId:   req.user.uid,
+      userId,
+      requestId: req.id,
+    }, 'User unbanned');
+
+    addAuditLog(req.user.uid, 'user_unbanned', userId, 'user');
+
+    return reply.send({ success: true, message: 'User unbanned' });
+  });
+
+  // ── Get all users ──────────────────────────────────────────────────────────
   fastify.get('/users', { preHandler: verifyAdmin }, async (req, reply) => {
-    const snap = await db.collection('users')
-      .orderBy('createdAt', 'desc').limit(100).get();
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    const snap  = await db.collection('users')
+      .orderBy('createdAt','desc').limit(limit).get();
+
     return reply.send({
       success: true,
       count:   snap.docs.length,
       users:   snap.docs.map(d => ({
-        id:    d.id,
-        name:  d.data().name,
-        phone: d.data().phone,
-        role:  d.data().role,
-        banned: d.data().banned || false,
+        id:          d.id,
+        name:        d.data().name,
+        phone:       d.data().phone,
+        role:        d.data().role,
+        banned:      d.data().banned      || false,
         gstVerified: d.data().gstVerified || false,
-        createdAt: d.data().createdAt,
+        createdAt:   d.data().createdAt,
       })),
     });
   });

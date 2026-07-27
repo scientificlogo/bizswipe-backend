@@ -66,7 +66,6 @@ fastify.setErrorHandler((error, request, reply) => {
     userId:    request.user?.uid,
   }, 'Request error');
 
-  // JSON Schema validation errors
   if (error.validation) {
     return reply.code(400).send({
       success:   false,
@@ -76,7 +75,6 @@ fastify.setErrorHandler((error, request, reply) => {
     });
   }
 
-  // Custom app errors
   if (error instanceof AppError) {
     return reply.code(error.statusCode).send({
       success:   false,
@@ -86,10 +84,9 @@ fastify.setErrorHandler((error, request, reply) => {
     });
   }
 
-  // Generic 500 — never leak stack trace
   reply.code(error.statusCode || 500).send({
     success:   false,
-    error:     error.statusCode < 500 ? error.message : 'Internal server error',
+    error:     (error.statusCode && error.statusCode < 500) ? error.message : 'Internal server error',
     requestId: request.id,
   });
 });
@@ -103,7 +100,7 @@ fastify.setNotFoundHandler((request, reply) => {
   });
 });
 
-// ── 7. Routes — v1 (versioned) ────────────────────────────────────────────────
+// ── 7. Routes v1 ─────────────────────────────────────────────────────────────
 fastify.register(async (app) => {
   app.register(require('./routes/health'),        { prefix: '/health' });
   app.register(require('./routes/gst'),           { prefix: '/verify' });
@@ -115,7 +112,7 @@ fastify.register(async (app) => {
   app.register(require('./routes/admin'),         { prefix: '/admin' });
 }, { prefix: '/api/v1' });
 
-// ── 8. Legacy routes /api (backward compat — existing app uses these) ─────────
+// ── 8. Legacy routes /api ─────────────────────────────────────────────────────
 fastify.register(require('./routes/health'),        { prefix: '/api' });
 fastify.register(require('./routes/gst'),           { prefix: '/api/verify' });
 fastify.register(require('./routes/listings'),      { prefix: '/api/listings' });
@@ -127,8 +124,11 @@ fastify.register(require('./routes/admin'),         { prefix: '/api/admin' });
 
 // ── 9. Graceful Shutdown ──────────────────────────────────────────────────────
 const gracefulShutdown = async (signal) => {
-  fastify.log.info({ signal }, 'Shutdown received — closing gracefully');
+  fastify.log.info({ signal }, 'Shutdown received');
   try {
+    // Stop Bull workers first
+    const { stopWorkers } = require('./workers');
+    await stopWorkers();
     await fastify.close();
     process.exit(0);
   } catch (err) {
@@ -141,20 +141,33 @@ process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
 
 process.on('uncaughtException', (err) => {
-  fastify.log.error({ err }, 'UNCAUGHT EXCEPTION — exiting');
+  fastify.log.error({ err }, 'UNCAUGHT EXCEPTION');
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
-  fastify.log.error({ reason }, 'UNHANDLED REJECTION — exiting');
+  fastify.log.error({ reason }, 'UNHANDLED REJECTION');
   process.exit(1);
 });
 
 // ── 10. Start ─────────────────────────────────────────────────────────────────
 const start = async () => {
   try {
-    await fastify.listen({ port: parseInt(process.env.PORT) || 3000, host: '0.0.0.0' });
-    fastify.log.info({ env: process.env.NODE_ENV, port: process.env.PORT || 3000 }, 'BizSwipe Backend v2.0.0 started');
+    await fastify.listen({
+      port: parseInt(process.env.PORT) || 3000,
+      host: '0.0.0.0',
+    });
+
+    // Start background workers AFTER server is listening
+    const { startWorkers } = require('./workers');
+    startWorkers();
+
+    fastify.log.info({
+      env:     process.env.NODE_ENV,
+      port:    process.env.PORT || 3000,
+      version: '2.1.0',
+    }, 'BizSwipe Backend started');
+
   } catch (err) {
     fastify.log.error(err, 'Failed to start');
     process.exit(1);

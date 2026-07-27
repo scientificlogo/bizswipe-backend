@@ -3,8 +3,8 @@
 const { verifyToken }  = require('../middleware/auth');
 const { db }           = require('../config/firebase');
 const { FieldValue }   = require('firebase-admin/firestore');
-const { notifyUser }   = require('../utils/pushNotification');
-const { NotFoundError, ForbiddenError, ConflictError } = require('../utils/errors');
+const { ConflictError } = require('../utils/errors');
+const { addPushJob }   = require('../utils/queue');
 
 // ── Schemas ───────────────────────────────────────────────────────────────────
 const acceptSchema = {
@@ -42,7 +42,7 @@ module.exports = async (fastify) => {
     const { interestId } = req.body;
     const start          = Date.now();
 
-    // ── Pre-transaction reads ─────────────────────────────────────────────
+    // Pre-transaction reads
     const interestRef = db.collection('interests').doc(interestId);
     const interestDoc = await interestRef.get();
 
@@ -75,7 +75,7 @@ module.exports = async (fastify) => {
       });
     }
 
-    // Get seller + listing data (outside transaction for reads)
+    // Get seller + listing data
     const [sellerDoc, listingDoc] = await Promise.all([
       db.collection('users').doc(uid).get(),
       db.collection('listings').doc(interest.listingId).get(),
@@ -85,19 +85,18 @@ module.exports = async (fastify) => {
     const listing = listingDoc.data() || {};
 
     // ── ATOMIC TRANSACTION ────────────────────────────────────────────────
-    // All 3 writes happen together or none at all!
     let matchId;
 
     try {
       matchId = await db.runTransaction(async (tx) => {
 
-        // Re-read inside transaction (prevents race condition)
+        // Re-read inside transaction (race condition prevention)
         const freshInterest = await tx.get(interestRef);
         if (freshInterest.data().status !== 'pending') {
           throw new ConflictError('Interest already processed');
         }
 
-        // Check for existing match (inside transaction)
+        // Check for existing match inside transaction
         const existingMatchSnap = await db.collection('matches')
           .where('buyerId',   '==', interest.buyerId)
           .where('sellerId',  '==', uid)
@@ -105,16 +104,15 @@ module.exports = async (fastify) => {
           .limit(1).get();
 
         if (!existingMatchSnap.empty) {
-          // Match exists — just update interest and return
           tx.update(interestRef, { status: 'accepted' });
           return existingMatchSnap.docs[0].id;
         }
 
-        // Create new match ref
+        // Create refs
         const matchRef   = db.collection('matches').doc();
         const messageRef = db.collection('messages').doc();
 
-        // Write 1: Update interest status
+        // Write 1: Update interest
         tx.update(interestRef, {
           status:     'accepted',
           acceptedAt: FieldValue.serverTimestamp(),
@@ -122,16 +120,16 @@ module.exports = async (fastify) => {
 
         // Write 2: Create match
         tx.set(matchRef, {
-          buyerId:     interest.buyerId,
-          buyerName:   interest.buyerName,
-          buyerPhone:  interest.buyerPhone  || '',
-          sellerId:    uid,
-          sellerName:  seller.name          || 'Seller',
-          sellerPhone: seller.phone         || '',
-          listingId:   interest.listingId,
-          listingName: interest.listingName || '',
+          buyerId:      interest.buyerId,
+          buyerName:    interest.buyerName,
+          buyerPhone:   interest.buyerPhone  || '',
+          sellerId:     uid,
+          sellerName:   seller.name          || 'Seller',
+          sellerPhone:  seller.phone         || '',
+          listingId:    interest.listingId,
+          listingName:  interest.listingName || '',
           businessName: listing.businessName || '', // Revealed after match!
-          createdAt:   FieldValue.serverTimestamp(),
+          createdAt:    FieldValue.serverTimestamp(),
         });
 
         // Write 3: System message
@@ -159,6 +157,7 @@ module.exports = async (fastify) => {
     }
 
     req.log.info({
+      event:     'match_created',
       uid,
       matchId,
       buyerId:   interest.buyerId,
@@ -167,20 +166,13 @@ module.exports = async (fastify) => {
       requestId: req.id,
     }, 'Match created successfully');
 
-    // ── Push notification (fire and forget — don't block response) ────────
-    setImmediate(async () => {
-      try {
-        await notifyUser(
-          db,
-          interest.buyerId,
-          "It's a Match! 🎉",
-          `${seller.name || 'Seller'} accepted your interest. Start chatting now!`,
-          { type: 'match', matchId, screen: 'Matches' }
-        );
-      } catch (err) {
-        req.log.warn({ err: err.message, buyerId: interest.buyerId }, 'Push notification failed');
-      }
-    });
+    // ── Fix #3: Push via Bull queue (non-blocking, retries on failure) ────
+    addPushJob(
+      interest.buyerId,
+      "It's a Match! 🎉",
+      `${seller.name || 'Seller'} accepted your interest. Start chatting now!`,
+      { type: 'match', matchId, screen: 'Matches' }
+    );
 
     return reply.code(201).send({
       success: true,
@@ -228,7 +220,7 @@ module.exports = async (fastify) => {
       declinedAt: FieldValue.serverTimestamp(),
     });
 
-    req.log.info({ uid, interestId, requestId: req.id }, 'Interest declined');
+    req.log.info({ event:'interest_declined', uid, interestId, requestId: req.id }, 'Interest declined');
 
     return reply.send({ success: true });
   });
@@ -247,11 +239,10 @@ module.exports = async (fastify) => {
     },
     config: { rateLimit: { max: 60, timeWindow: '1 minute' } },
   }, async (req, reply) => {
-    const { uid }   = req.user;
-    const { role }  = req.query;
-    const limit     = Math.min(parseInt(req.query.limit) || 50, 50);
-
-    const field = role === 'seller' ? 'sellerId' : 'buyerId';
+    const { uid }  = req.user;
+    const { role } = req.query;
+    const limit    = Math.min(parseInt(req.query.limit) || 50, 50);
+    const field    = role === 'seller' ? 'sellerId' : 'buyerId';
 
     const snap = await db.collection('matches')
       .where(field, '==', uid)
@@ -286,7 +277,6 @@ module.exports = async (fastify) => {
 
     const match = matchDoc.data();
 
-    // Only buyer or seller can view
     if (match.buyerId !== uid && match.sellerId !== uid) {
       return reply.code(403).send({
         success:   false,

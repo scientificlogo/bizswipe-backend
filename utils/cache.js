@@ -6,9 +6,9 @@ const { Redis } = require('@upstash/redis');
 let redis;
 try {
   redis = new Redis({
-    url:   process.env.UPSTASH_REDIS_URL,
-    token: process.env.UPSTASH_REDIS_TOKEN,
-  });
+  url:   process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 } catch (err) {
   console.error('Redis init failed — caching disabled:', err.message);
 }
