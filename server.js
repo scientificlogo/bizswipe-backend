@@ -22,21 +22,8 @@ const fastify = require('fastify')({
   },
   trustProxy: true,
   genReqId:   () => crypto.randomUUID(),
+  bodyLimit:  10 * 1024, // Fix #14 — 10KB max request body
 });
-
-// Fix #14 — Request body size limit (10KB max)
-fastify.addContentTypeParser(
-  'application/json',
-  { parseAs: 'string', bodyLimit: 10 * 1024 },
-  (req, body, done) => {
-    try {
-      done(null, JSON.parse(body));
-    } catch (err) {
-      err.statusCode = 400;
-      done(err, undefined);
-    }
-  }
-);
 
 // ── 3. Plugins ────────────────────────────────────────────────────────────────
 fastify.register(require('@fastify/cors'), {
@@ -80,6 +67,7 @@ fastify.setErrorHandler((error, request, reply) => {
     userId:    request.user?.uid,
   }, 'Request error');
 
+  // JSON Schema validation errors
   if (error.validation) {
     return reply.code(400).send({
       success:   false,
@@ -89,6 +77,16 @@ fastify.setErrorHandler((error, request, reply) => {
     });
   }
 
+  // Body too large (Fix #14)
+  if (error.statusCode === 413) {
+    return reply.code(413).send({
+      success:   false,
+      error:     'Request body too large (max 10KB)',
+      requestId: request.id,
+    });
+  }
+
+  // Custom app errors
   if (error instanceof AppError) {
     return reply.code(error.statusCode).send({
       success:   false,
@@ -98,6 +96,7 @@ fastify.setErrorHandler((error, request, reply) => {
     });
   }
 
+  // Generic 500
   reply.code(error.statusCode || 500).send({
     success:   false,
     error:     (error.statusCode && error.statusCode < 500) ? error.message : 'Internal server error',
@@ -140,7 +139,6 @@ fastify.register(require('./routes/admin'),         { prefix: '/api/admin' });
 const gracefulShutdown = async (signal) => {
   fastify.log.info({ signal }, 'Shutdown received');
   try {
-    // Stop Bull workers first
     const { stopWorkers } = require('./workers');
     await stopWorkers();
     await fastify.close();
@@ -172,7 +170,7 @@ const start = async () => {
       host: '0.0.0.0',
     });
 
-    // Start background workers AFTER server is listening
+    // Start workers AFTER server is listening
     const { startWorkers } = require('./workers');
     startWorkers();
 
