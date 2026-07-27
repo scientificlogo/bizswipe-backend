@@ -5,7 +5,8 @@ const { db }              = require('../config/firebase');
 const { sanitizeListing } = require('../utils/sanitize');
 const { FieldValue }      = require('firebase-admin/firestore');
 const { createListing: createSchema, pagination } = require('../schemas');
-const { ValidationError, NotFoundError, ConflictError } = require('../utils/errors');
+const { ConflictError, NotFoundError } = require('../utils/errors');
+const cache = require('../utils/cache');
 
 const MAX_LIMIT = 50;
 
@@ -21,7 +22,6 @@ module.exports = async (fastify) => {
     const data    = req.body;
     const start   = Date.now();
 
-    // Check existing listing
     const existing = await db.collection('listings')
       .where('sellerId', '==', uid)
       .where('status', 'in', ['active'])
@@ -36,7 +36,6 @@ module.exports = async (fastify) => {
       });
     }
 
-    // Get seller profile
     const sellerDoc = await db.collection('users').doc(uid).get();
     const seller    = sellerDoc.data() || {};
 
@@ -54,13 +53,16 @@ module.exports = async (fastify) => {
 
     const docRef = await db.collection('listings').add(listing);
 
+    // ── Invalidate all feed caches (new listing = stale cache) ────────────
+    setImmediate(() => cache.delPattern('feed:*'));
+
     req.log.info({
       event:     'listing_created',
       userId:    uid,
       listingId: docRef.id,
       duration:  Date.now() - start,
       requestId: req.id,
-    }, 'Listing created successfully');
+    }, 'Listing created');
 
     return reply.code(201).send({
       success:   true,
@@ -69,16 +71,15 @@ module.exports = async (fastify) => {
     });
   });
 
-  // ── Feed — Paginated listings ─────────────────────────────────────────────
+  // ── Feed — Paginated with REDIS CACHE ─────────────────────────────────────
   fastify.get('/feed', {
     preHandler: verifyToken,
     schema:     { querystring: pagination },
-    // Fix #11 — Rate limit per UID (not per IP)
     config: {
       rateLimit: {
-        max:        60,
-        timeWindow: '1 minute',
-        keyGenerator: (req) => req.user?.uid || req.ip,
+        max:          60,
+        timeWindow:   '1 minute',
+        keyGenerator: (req) => req.user?.uid || req.ip, // Fix #11 — per UID
       },
     },
   }, async (req, reply) => {
@@ -87,20 +88,27 @@ module.exports = async (fastify) => {
     const { lastId } = req.query;
     const start      = Date.now();
 
-    // Fix #6 — Validate pagination cursor
+    // ── Fix #2: Check Redis cache first ──────────────────────────────────
+    // Only cache first page (no lastId) — pagination pages not cached
+    if (!lastId) {
+      const cacheKey    = cache.keys.listingsFeed(uid, limit);
+      const cachedData  = await cache.get(cacheKey);
+      if (cachedData) {
+        req.log.info({
+          event:     'feed_cache_hit',
+          userId:    uid,
+          duration:  Date.now() - start,
+          requestId: req.id,
+        }, 'Feed served from cache');
+        return reply.send(cachedData);
+      }
+    }
+
+    // ── Fix #6: Validate pagination cursor ────────────────────────────────
     let lastDoc = null;
     if (lastId) {
-      // Validate lastId is a real listing that exists
       lastDoc = await db.collection('listings').doc(lastId).get();
-      if (!lastDoc.exists) {
-        return reply.code(400).send({
-          success:   false,
-          error:     'Invalid pagination cursor',
-          requestId: req.id,
-        });
-      }
-      // Security: can't use someone's private listing as cursor
-      if (lastDoc.data().status !== 'active') {
+      if (!lastDoc.exists || lastDoc.data().status !== 'active') {
         return reply.code(400).send({
           success:   false,
           error:     'Invalid pagination cursor',
@@ -114,7 +122,7 @@ module.exports = async (fastify) => {
       .where('buyerId', '==', uid).get();
     const swipedIds  = swipedSnap.docs.map(d => d.data().listingId);
 
-    // Build query
+    // Build + execute query
     let q = db.collection('listings')
       .where('status', '==', 'active')
       .orderBy('createdAt', 'desc')
@@ -146,21 +154,29 @@ module.exports = async (fastify) => {
         // businessName INTENTIONALLY hidden until match
       }));
 
+    const response = {
+      success:    true,
+      listings,
+      hasMore:    snap.docs.length > limit,
+      nextCursor: listings.length > 0 ? listings[listings.length - 1].id : null,
+      source:     'firestore',
+    };
+
+    // ── Save to cache (only first page) ──────────────────────────────────
+    if (!lastId) {
+      const cacheKey = cache.keys.listingsFeed(uid, limit);
+      setImmediate(() => cache.set(cacheKey, response, cache.TTL.LISTINGS_FEED));
+    }
+
     req.log.info({
-      event:     'feed_fetched',
+      event:     'feed_firestore_hit',
       userId:    uid,
       count:     listings.length,
       duration:  Date.now() - start,
       requestId: req.id,
-    }, 'Listings feed fetched');
+    }, 'Feed from Firestore');
 
-    return reply.send({
-      success: true,
-      listings,
-      hasMore: snap.docs.length > limit,
-      // Return last ID for next page cursor
-      nextCursor: listings.length > 0 ? listings[listings.length - 1].id : null,
-    });
+    return reply.send(response);
   });
 
   // ── Increment view count ──────────────────────────────────────────────────
@@ -168,16 +184,14 @@ module.exports = async (fastify) => {
     preHandler: verifyToken,
     config: {
       rateLimit: {
-        max:        10,
-        timeWindow: '1 minute',
-        // Fix #11 — per UID rate limit
+        max:          10,
+        timeWindow:   '1 minute',
         keyGenerator: (req) => `view_${req.user?.uid}_${req.params.listingId}`,
       },
     },
   }, async (req, reply) => {
     const { listingId } = req.params;
 
-    // Validate listing exists
     const listingDoc = await db.collection('listings').doc(listingId).get();
     if (!listingDoc.exists) {
       return reply.code(404).send({
@@ -202,21 +216,15 @@ module.exports = async (fastify) => {
     const { uid } = req.user;
 
     const snap = await db.collection('listings')
-      .where('sellerId', '==', uid)
-      .limit(1).get();
+      .where('sellerId', '==', uid).limit(1).get();
 
-    if (snap.empty) {
-      return reply.send({ success: true, listing: null });
-    }
+    if (snap.empty) return reply.send({ success: true, listing: null });
 
     const d = snap.docs[0];
-    return reply.send({
-      success: true,
-      listing: { id: d.id, ...d.data() },
-    });
+    return reply.send({ success: true, listing: { id: d.id, ...d.data() } });
   });
 
-  // ── Get single listing (authenticated) ───────────────────────────────────
+  // ── Get single listing ────────────────────────────────────────────────────
   fastify.get('/:listingId', {
     preHandler: verifyToken,
     config:     { rateLimit: { max: 60, timeWindow: '1 minute' } },
@@ -225,7 +233,6 @@ module.exports = async (fastify) => {
     const { uid }       = req.user;
 
     const doc = await db.collection('listings').doc(listingId).get();
-
     if (!doc.exists) {
       return reply.code(404).send({
         success:   false,
@@ -234,12 +241,9 @@ module.exports = async (fastify) => {
       });
     }
 
-    const data = doc.data();
-
-    // Hide business name unless it's seller's own listing or matched
+    const data    = doc.data();
     const isOwner = data.sellerId === uid;
 
-    // Check if buyer is matched with this listing
     let isMatched = false;
     if (!isOwner) {
       const matchSnap = await db.collection('matches')
@@ -252,59 +256,45 @@ module.exports = async (fastify) => {
     return reply.send({
       success: true,
       listing: {
-        id:           doc.id,
+        id: doc.id,
         ...data,
-        // Only reveal businessName to owner or matched buyer
         businessName: (isOwner || isMatched) ? data.businessName : undefined,
       },
     });
   });
 
-  // ── Update listing (seller only) ──────────────────────────────────────────
+  // ── Update listing ────────────────────────────────────────────────────────
   fastify.put('/:listingId', {
     preHandler: verifyToken,
     config:     { rateLimit: { max: 10, timeWindow: '1 hour' } },
   }, async (req, reply) => {
     const { uid }       = req.user;
     const { listingId } = req.params;
-    const data          = req.body;
 
     const doc = await db.collection('listings').doc(listingId).get();
-
     if (!doc.exists) {
-      return reply.code(404).send({
-        success:   false,
-        error:     'Listing not found',
-        requestId: req.id,
-      });
+      return reply.code(404).send({ success:false, error:'Listing not found', requestId:req.id });
     }
-
     if (doc.data().sellerId !== uid) {
-      return reply.code(403).send({
-        success:   false,
-        error:     'You can only edit your own listing',
-        requestId: req.id,
-      });
+      return reply.code(403).send({ success:false, error:'Unauthorized', requestId:req.id });
     }
 
     const updated = {
-      ...sanitizeListing({ ...doc.data(), ...data }),
+      ...sanitizeListing({ ...doc.data(), ...req.body }),
       updatedAt: FieldValue.serverTimestamp(),
     };
 
     await db.collection('listings').doc(listingId).update(updated);
 
-    req.log.info({
-      event:     'listing_updated',
-      userId:    uid,
-      listingId,
-      requestId: req.id,
-    }, 'Listing updated');
+    // Invalidate caches
+    setImmediate(() => cache.delPattern('feed:*'));
+
+    req.log.info({ event:'listing_updated', userId:uid, listingId, requestId:req.id }, 'Listing updated');
 
     return reply.send({ success: true, message: 'Listing updated!' });
   });
 
-  // ── Delete/Deactivate listing (seller only) ───────────────────────────────
+  // ── Deactivate listing ────────────────────────────────────────────────────
   fastify.delete('/:listingId', {
     preHandler: verifyToken,
     config:     { rateLimit: { max: 5, timeWindow: '1 hour' } },
@@ -313,35 +303,22 @@ module.exports = async (fastify) => {
     const { listingId } = req.params;
 
     const doc = await db.collection('listings').doc(listingId).get();
-
     if (!doc.exists) {
-      return reply.code(404).send({
-        success:   false,
-        error:     'Listing not found',
-        requestId: req.id,
-      });
+      return reply.code(404).send({ success:false, error:'Listing not found', requestId:req.id });
     }
-
     if (doc.data().sellerId !== uid) {
-      return reply.code(403).send({
-        success:   false,
-        error:     'You can only delete your own listing',
-        requestId: req.id,
-      });
+      return reply.code(403).send({ success:false, error:'Unauthorized', requestId:req.id });
     }
 
-    // Soft delete — set status to 'inactive'
     await db.collection('listings').doc(listingId).update({
-      status:      'inactive',
+      status:        'inactive',
       deactivatedAt: FieldValue.serverTimestamp(),
     });
 
-    req.log.info({
-      event:     'listing_deactivated',
-      userId:    uid,
-      listingId,
-      requestId: req.id,
-    }, 'Listing deactivated');
+    // Invalidate caches
+    setImmediate(() => cache.delPattern('feed:*'));
+
+    req.log.info({ event:'listing_deactivated', userId:uid, listingId, requestId:req.id }, 'Listing deactivated');
 
     return reply.send({ success: true, message: 'Listing deactivated' });
   });

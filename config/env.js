@@ -35,6 +35,8 @@ try {
 if (!process.env.ADMIN_UIDS) {
   console.warn('⚠️  WARNING: ADMIN_UIDS not set — admin routes will be inaccessible');
 }
-
+if (!process.env.UPSTASH_REDIS_URL) {
+  console.warn('⚠️  WARNING: UPSTASH_REDIS_URL not set — caching disabled');
+}
 console.log('✅ All environment variables validated');
 module.exports = {};
