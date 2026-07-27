@@ -24,6 +24,20 @@ const fastify = require('fastify')({
   genReqId:   () => crypto.randomUUID(),
 });
 
+// Fix #14 — Request body size limit (10KB max)
+fastify.addContentTypeParser(
+  'application/json',
+  { parseAs: 'string', bodyLimit: 10 * 1024 },
+  (req, body, done) => {
+    try {
+      done(null, JSON.parse(body));
+    } catch (err) {
+      err.statusCode = 400;
+      done(err, undefined);
+    }
+  }
+);
+
 // ── 3. Plugins ────────────────────────────────────────────────────────────────
 fastify.register(require('@fastify/cors'), {
   origin: process.env.NODE_ENV === 'production'
