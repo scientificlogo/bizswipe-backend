@@ -22,10 +22,60 @@ const fastify = require('fastify')({
   },
   trustProxy: true,
   genReqId:   () => crypto.randomUUID(),
-  bodyLimit:  10 * 1024, // Fix #14 — 10KB max request body
+  bodyLimit:  10 * 1024, // Fix #14 — 10KB max
 });
 
-// ── 3. Plugins ────────────────────────────────────────────────────────────────
+// ── 3. Swagger (Fix #10 — API Docs) ──────────────────────────────────────────
+fastify.register(require('@fastify/swagger'), {
+  openapi: {
+    info: {
+      title:       'BizSwipe API',
+      description: "India's first Tinder-style Business M&A Platform API",
+      version:     '2.1.0',
+      contact: {
+        name: 'BizSwipe Support',
+        email: 'support@bizswipe.app',
+      },
+    },
+    servers: [
+      { url: 'https://bizswipe-backend-production.up.railway.app', description: 'Production' },
+      { url: 'http://localhost:3000', description: 'Local Development' },
+    ],
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type:         'http',
+          scheme:       'bearer',
+          bearerFormat: 'JWT',
+          description:  'Firebase ID Token — get from Firebase Auth',
+        },
+      },
+    },
+    security: [{ bearerAuth: [] }],
+    tags: [
+      { name: 'Health',        description: 'Server health checks' },
+      { name: 'Auth/GST',      description: 'GST verification' },
+      { name: 'Listings',      description: 'Business listing management' },
+      { name: 'Matches',       description: 'Match and interest management' },
+      { name: 'Messages',      description: 'Chat messages' },
+      { name: 'Notifications', description: 'Push notifications' },
+      { name: 'Admin',         description: 'Admin-only endpoints' },
+    ],
+  },
+});
+
+fastify.register(require('@fastify/swagger-ui'), {
+  routePrefix: '/docs',
+  uiConfig: {
+    docExpansion:           'list',
+    deepLinking:            true,
+    displayRequestDuration: true,
+    filter:                 true,
+  },
+  staticCSP: true,
+});
+
+// ── 4. Plugins ────────────────────────────────────────────────────────────────
 fastify.register(require('@fastify/cors'), {
   origin: process.env.NODE_ENV === 'production'
     ? ['https://bizswipe.app', /^exp:\/\//]
@@ -50,12 +100,12 @@ fastify.register(require('@fastify/rate-limit'), {
   }),
 });
 
-// ── 4. Request ID in every response ──────────────────────────────────────────
+// ── 5. Request ID in every response ──────────────────────────────────────────
 fastify.addHook('onSend', async (request, reply) => {
   reply.header('X-Request-Id', request.id);
 });
 
-// ── 5. Global Error Handler ───────────────────────────────────────────────────
+// ── 6. Global Error Handler ───────────────────────────────────────────────────
 fastify.setErrorHandler((error, request, reply) => {
   const { AppError } = require('./utils/errors');
 
@@ -67,7 +117,6 @@ fastify.setErrorHandler((error, request, reply) => {
     userId:    request.user?.uid,
   }, 'Request error');
 
-  // JSON Schema validation errors
   if (error.validation) {
     return reply.code(400).send({
       success:   false,
@@ -77,7 +126,6 @@ fastify.setErrorHandler((error, request, reply) => {
     });
   }
 
-  // Body too large (Fix #14)
   if (error.statusCode === 413) {
     return reply.code(413).send({
       success:   false,
@@ -86,7 +134,6 @@ fastify.setErrorHandler((error, request, reply) => {
     });
   }
 
-  // Custom app errors
   if (error instanceof AppError) {
     return reply.code(error.statusCode).send({
       success:   false,
@@ -96,7 +143,6 @@ fastify.setErrorHandler((error, request, reply) => {
     });
   }
 
-  // Generic 500
   reply.code(error.statusCode || 500).send({
     success:   false,
     error:     (error.statusCode && error.statusCode < 500) ? error.message : 'Internal server error',
@@ -104,7 +150,7 @@ fastify.setErrorHandler((error, request, reply) => {
   });
 });
 
-// ── 6. 404 Handler ────────────────────────────────────────────────────────────
+// ── 7. 404 Handler ────────────────────────────────────────────────────────────
 fastify.setNotFoundHandler((request, reply) => {
   reply.code(404).send({
     success:   false,
@@ -113,7 +159,7 @@ fastify.setNotFoundHandler((request, reply) => {
   });
 });
 
-// ── 7. Routes v1 ─────────────────────────────────────────────────────────────
+// ── 8. Routes v1 ─────────────────────────────────────────────────────────────
 fastify.register(async (app) => {
   app.register(require('./routes/health'),        { prefix: '/health' });
   app.register(require('./routes/gst'),           { prefix: '/verify' });
@@ -125,7 +171,7 @@ fastify.register(async (app) => {
   app.register(require('./routes/admin'),         { prefix: '/admin' });
 }, { prefix: '/api/v1' });
 
-// ── 8. Legacy routes /api ─────────────────────────────────────────────────────
+// ── 9. Legacy routes /api ─────────────────────────────────────────────────────
 fastify.register(require('./routes/health'),        { prefix: '/api' });
 fastify.register(require('./routes/gst'),           { prefix: '/api/verify' });
 fastify.register(require('./routes/listings'),      { prefix: '/api/listings' });
@@ -135,7 +181,7 @@ fastify.register(require('./routes/notifications'), { prefix: '/api/notification
 fastify.register(require('./routes/messages'),      { prefix: '/api/messages' });
 fastify.register(require('./routes/admin'),         { prefix: '/api/admin' });
 
-// ── 9. Graceful Shutdown ──────────────────────────────────────────────────────
+// ── 10. Graceful Shutdown ─────────────────────────────────────────────────────
 const gracefulShutdown = async (signal) => {
   fastify.log.info({ signal }, 'Shutdown received');
   try {
@@ -162,7 +208,7 @@ process.on('unhandledRejection', (reason) => {
   process.exit(1);
 });
 
-// ── 10. Start ─────────────────────────────────────────────────────────────────
+// ── 11. Start ─────────────────────────────────────────────────────────────────
 const start = async () => {
   try {
     await fastify.listen({
@@ -170,7 +216,6 @@ const start = async () => {
       host: '0.0.0.0',
     });
 
-    // Start workers AFTER server is listening
     const { startWorkers } = require('./workers');
     startWorkers();
 
@@ -178,6 +223,7 @@ const start = async () => {
       env:     process.env.NODE_ENV,
       port:    process.env.PORT || 3000,
       version: '2.1.0',
+      docs:    'https://bizswipe-backend-production.up.railway.app/docs',
     }, 'BizSwipe Backend started');
 
   } catch (err) {
