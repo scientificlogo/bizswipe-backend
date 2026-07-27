@@ -5,3 +5,6 @@ config/serviceAccountKey.json
 .DS_Store
 **/.DS_Store
 routes/.DS_Store
+*.apk
+*.ipa
+*.aab
