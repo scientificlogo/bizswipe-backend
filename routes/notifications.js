@@ -1,8 +1,12 @@
 'use strict';
 
-const { verifyToken } = require('../middleware/auth');
-const { db }          = require('../config/firebase');
-const { savePushToken: tokenSchema } = require('../schemas');
+const { verifyToken, verifyAdmin } = require('../middleware/auth');
+const { db }         = require('../config/firebase');
+const { notifyUser } = require('../utils/pushNotification');
+const {
+  savePushToken:    tokenSchema,
+  sendNotification: sendSchema,
+} = require('../schemas');
 
 module.exports = async (fastify) => {
 
@@ -25,35 +29,40 @@ module.exports = async (fastify) => {
     return reply.send({ success: true });
   });
 
-  // ── Send notification (admin or internal use) ──────────────────────────────
+  // ── Send notification (ADMIN ONLY) ─────────────────────────────────────────
+  // This route sends an arbitrary title and body to any user. Behind plain
+  // verifyToken it let any logged-in user push-spam any other user they could
+  // guess the uid of — a phishing vector ("verify your PAN at ..."). It is
+  // admin-only, schema-validated and audit-logged.
   fastify.post('/send', {
-    preHandler: verifyToken,
+    preHandler: verifyAdmin,
+    schema:     sendSchema,
     config:     { rateLimit: { max: 20, timeWindow: '1 minute' } },
   }, async (req, reply) => {
     const { userId, title, body, data } = req.body;
 
-    if (!userId || !title || !body) {
-      return reply.code(400).send({
+    const userDoc = await db.collection('users').doc(userId).get();
+
+    if (!userDoc.exists) {
+      return reply.code(404).send({
         success:   false,
-        error:     'userId, title, and body are required',
+        error:     'User not found',
         requestId: req.id,
       });
     }
 
-    const userDoc   = await db.collection('users').doc(userId).get();
-    const pushToken = userDoc.data()?.pushToken;
-
-    if (!pushToken) {
+    if (!userDoc.data()?.pushToken) {
       return reply.send({ success: false, message: 'No push token for user' });
     }
 
-    await fetch('https://exp.host/--/api/v2/push/send', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ to: pushToken, sound: 'default', title, body, data: data || {}, priority: 'high' }),
-    });
+    await notifyUser(db, userId, title, body, data || {});
 
-    req.log.info({ userId, title, requestId: req.id }, 'Push notification sent');
+    req.log.info({
+      adminId:   req.user.uid,
+      userId,
+      title,
+      requestId: req.id,
+    }, 'Admin push notification sent');
 
     return reply.send({ success: true });
   });

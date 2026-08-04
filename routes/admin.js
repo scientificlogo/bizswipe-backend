@@ -5,6 +5,7 @@ const { db }           = require('../config/firebase');
 const { FieldValue }   = require('firebase-admin/firestore');
 const { notifyUser }   = require('../utils/pushNotification');
 const { addAuditLog, addPushJob } = require('../utils/queue');
+const cache            = require('../utils/cache');
 const { rejectListing: rejectSchema, banUser: banSchema } = require('../schemas');
 
 module.exports = async (fastify) => {
@@ -197,6 +198,10 @@ module.exports = async (fastify) => {
       banReason: reason,
     });
 
+    // verifyToken caches ban status for 5 minutes — drop the key so the ban
+    // takes effect on the user's very next request rather than 5 minutes later.
+    await cache.del(`banned:${userId}`);
+
     // Deactivate all their listings
     const listings = await db.collection('listings').where('sellerId','==',userId).get();
     if (!listings.empty) {
@@ -234,6 +239,9 @@ module.exports = async (fastify) => {
       unbannedAt: FieldValue.serverTimestamp(),
       unbannedBy: req.user.uid,
     });
+
+    // Without this the user stays locked out for up to 5 more minutes.
+    await cache.del(`banned:${userId}`);
 
     req.log.info({
       event:     'user_unbanned',

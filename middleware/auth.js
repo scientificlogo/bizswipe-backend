@@ -1,7 +1,41 @@
 'use strict';
 
-const { auth }              = require('../config/firebase');
+const { auth, db }          = require('../config/firebase');
+const cache                 = require('../utils/cache');
 const { AuthError, ForbiddenError, TokenExpiredError } = require('../utils/errors');
+
+// ── Ban check ─────────────────────────────────────────────────────────────────
+// admin.js sets banned:true on the user document, but nothing used to read it,
+// so a banned user carried on swiping and messaging normally.
+//
+// Checked on every authenticated request, so the result is cached for 5
+// minutes to keep this from becoming a Firestore read per request. A ban
+// therefore takes effect within 5 minutes; banUser clears the key so in
+// practice it is immediate.
+const BAN_CACHE_TTL = 5 * 60;
+
+const isBanned = async (uid) => {
+  try {
+    const key = `banned:${uid}`;
+
+    // Stored as strings, not 0/1 — cache.get() returns `data || null`, so a
+    // falsy cached value would look like a miss and re-read Firestore on
+    // every request, which is the common case.
+    const cached = await cache.get(key);
+    if (cached === 'yes') return true;
+    if (cached === 'no')  return false;
+
+    const snap   = await db.collection('users').doc(uid).get();
+    const banned = snap.exists && snap.data()?.banned === true;
+
+    await cache.set(key, banned ? 'yes' : 'no', BAN_CACHE_TTL);
+    return banned;
+  } catch (err) {
+    // Fail open — a Firestore or Redis hiccup must not lock every user out.
+    console.error('Ban check failed, allowing request:', err.message);
+    return false;
+  }
+};
 
 // ── Verify Firebase JWT Token ─────────────────────────────────────────────────
 const verifyToken = async (req, reply) => {
@@ -29,6 +63,17 @@ const verifyToken = async (req, reply) => {
     }
 
     const decoded = await auth.verifyIdToken(token);
+
+    if (await isBanned(decoded.uid)) {
+      req.log.warn({ uid: decoded.uid, requestId: req.id, route: req.url }, 'Banned user blocked');
+
+      return reply.code(403).send({
+        success:   false,
+        error:     'Your account has been suspended. Contact support.',
+        code:      'ACCOUNT_BANNED',
+        requestId: req.id,
+      });
+    }
 
     req.user = {
       uid:   decoded.uid,

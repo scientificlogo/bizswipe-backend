@@ -72,6 +72,20 @@ const savePushToken = {
   },
 };
 
+const sendNotification = {
+  body: {
+    type:     'object',
+    required: ['userId', 'title', 'body'],
+    additionalProperties: false,
+    properties: {
+      userId: { type: 'string', minLength: 1,  maxLength: 128  },
+      title:  { type: 'string', minLength: 1,  maxLength: 100  },
+      body:   { type: 'string', minLength: 1,  maxLength: 500  },
+      data:   { type: 'object', maxProperties: 10 },
+    },
+  },
+};
+
 // ── Admin ─────────────────────────────────────────────────────────────────────
 const rejectListing = {
   body: {
@@ -99,6 +113,7 @@ module.exports = {
   createListing,
   sendMessage,
   savePushToken,
+  sendNotification,
   rejectListing,
   banUser,
 };
