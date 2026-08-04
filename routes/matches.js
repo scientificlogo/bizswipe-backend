@@ -1,12 +1,12 @@
 'use strict';
 
-const { verifyToken }  = require('../middleware/auth');
-const { db }           = require('../config/firebase');
-const { FieldValue }   = require('firebase-admin/firestore');
+const { verifyToken }   = require('../middleware/auth');
+const { idempotency }   = require('../middleware/idempotency');
+const { db }            = require('../config/firebase');
+const { FieldValue }    = require('firebase-admin/firestore');
 const { ConflictError } = require('../utils/errors');
-const { addPushJob }   = require('../utils/queue');
+const { addPushJob }    = require('../utils/queue');
 
-// ── Schemas ───────────────────────────────────────────────────────────────────
 const acceptSchema = {
   body: {
     type: 'object',
@@ -29,12 +29,11 @@ const declineSchema = {
   },
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
 module.exports = async (fastify) => {
 
   // ── Accept Interest → Atomic Transaction ──────────────────────────────────
   fastify.post('/accept', {
-    preHandler: verifyToken,
+    preHandler: [verifyToken, idempotency], // Fix #8 — Idempotency
     schema:     acceptSchema,
     config:     { rateLimit: { max: 20, timeWindow: '1 minute' } },
   }, async (req, reply) => {
@@ -42,40 +41,24 @@ module.exports = async (fastify) => {
     const { interestId } = req.body;
     const start          = Date.now();
 
-    // Pre-transaction reads
     const interestRef = db.collection('interests').doc(interestId);
     const interestDoc = await interestRef.get();
 
     if (!interestDoc.exists) {
-      return reply.code(404).send({
-        success:   false,
-        error:     'Interest not found',
-        requestId: req.id,
-      });
+      return reply.code(404).send({ success: false, error: 'Interest not found', requestId: req.id });
     }
 
     const interest = interestDoc.data();
 
-    // Only seller can accept
     if (interest.sellerId !== uid) {
       req.log.warn({ uid, interestId, requestId: req.id }, 'Unauthorized accept attempt');
-      return reply.code(403).send({
-        success:   false,
-        error:     'Only the seller can accept this interest',
-        requestId: req.id,
-      });
+      return reply.code(403).send({ success: false, error: 'Only the seller can accept', requestId: req.id });
     }
 
-    // Already processed
     if (interest.status !== 'pending') {
-      return reply.send({
-        success: true,
-        message: 'Already processed',
-        status:  interest.status,
-      });
+      return reply.send({ success: true, message: 'Already processed', status: interest.status });
     }
 
-    // Get seller + listing data
     const [sellerDoc, listingDoc] = await Promise.all([
       db.collection('users').doc(uid).get(),
       db.collection('listings').doc(interest.listingId).get(),
@@ -89,14 +72,11 @@ module.exports = async (fastify) => {
 
     try {
       matchId = await db.runTransaction(async (tx) => {
-
-        // Re-read inside transaction (race condition prevention)
         const freshInterest = await tx.get(interestRef);
         if (freshInterest.data().status !== 'pending') {
           throw new ConflictError('Interest already processed');
         }
 
-        // Check for existing match inside transaction
         const existingMatchSnap = await db.collection('matches')
           .where('buyerId',   '==', interest.buyerId)
           .where('sellerId',  '==', uid)
@@ -108,17 +88,14 @@ module.exports = async (fastify) => {
           return existingMatchSnap.docs[0].id;
         }
 
-        // Create refs
         const matchRef   = db.collection('matches').doc();
         const messageRef = db.collection('messages').doc();
 
-        // Write 1: Update interest
         tx.update(interestRef, {
           status:     'accepted',
           acceptedAt: FieldValue.serverTimestamp(),
         });
 
-        // Write 2: Create match
         tx.set(matchRef, {
           buyerId:      interest.buyerId,
           buyerName:    interest.buyerName,
@@ -128,11 +105,10 @@ module.exports = async (fastify) => {
           sellerPhone:  seller.phone         || '',
           listingId:    interest.listingId,
           listingName:  interest.listingName || '',
-          businessName: listing.businessName || '', // Revealed after match!
+          businessName: listing.businessName || '',
           createdAt:    FieldValue.serverTimestamp(),
         });
 
-        // Write 3: System message
         tx.set(messageRef, {
           matchId:   matchRef.id,
           senderId:  'system',
@@ -149,36 +125,26 @@ module.exports = async (fastify) => {
         return reply.send({ success: true, message: err.message });
       }
       req.log.error({ err, interestId, uid, requestId: req.id }, 'Transaction failed');
-      return reply.code(500).send({
-        success:   false,
-        error:     'Could not create match — please try again',
-        requestId: req.id,
-      });
+      return reply.code(500).send({ success: false, error: 'Could not create match — try again', requestId: req.id });
     }
 
     req.log.info({
       event:     'match_created',
-      uid,
-      matchId,
+      uid, matchId,
       buyerId:   interest.buyerId,
-      interestId,
       duration:  Date.now() - start,
       requestId: req.id,
-    }, 'Match created successfully');
+    }, 'Match created');
 
-    // ── Fix #3: Push via Bull queue (non-blocking, retries on failure) ────
+    // Push via Bull queue (non-blocking)
     addPushJob(
       interest.buyerId,
       "It's a Match! 🎉",
-      `${seller.name || 'Seller'} accepted your interest. Start chatting now!`,
+      `${seller.name || 'Seller'} accepted your interest. Start chatting!`,
       { type: 'match', matchId, screen: 'Matches' }
     );
 
-    return reply.code(201).send({
-      success: true,
-      matchId,
-      message: 'Match created successfully!',
-    });
+    return reply.code(201).send({ success: true, matchId, message: 'Match created!' });
   });
 
   // ── Decline Interest ──────────────────────────────────────────────────────
@@ -194,38 +160,27 @@ module.exports = async (fastify) => {
     const interestDoc = await interestRef.get();
 
     if (!interestDoc.exists) {
-      return reply.code(404).send({
-        success:   false,
-        error:     'Interest not found',
-        requestId: req.id,
-      });
+      return reply.code(404).send({ success: false, error: 'Interest not found', requestId: req.id });
     }
 
     const interest = interestDoc.data();
 
     if (interest.sellerId !== uid) {
-      return reply.code(403).send({
-        success:   false,
-        error:     'Unauthorized',
-        requestId: req.id,
-      });
+      return reply.code(403).send({ success: false, error: 'Unauthorized', requestId: req.id });
     }
 
     if (interest.status !== 'pending') {
       return reply.send({ success: true, message: 'Already processed' });
     }
 
-    await interestRef.update({
-      status:     'declined',
-      declinedAt: FieldValue.serverTimestamp(),
-    });
+    await interestRef.update({ status: 'declined', declinedAt: FieldValue.serverTimestamp() });
 
-    req.log.info({ event:'interest_declined', uid, interestId, requestId: req.id }, 'Interest declined');
+    req.log.info({ event: 'interest_declined', uid, interestId, requestId: req.id }, 'Interest declined');
 
     return reply.send({ success: true });
   });
 
-  // ── Get matches for user ──────────────────────────────────────────────────
+  // ── Get matches ───────────────────────────────────────────────────────────
   fastify.get('/', {
     preHandler: verifyToken,
     schema: {
@@ -247,8 +202,7 @@ module.exports = async (fastify) => {
     const snap = await db.collection('matches')
       .where(field, '==', uid)
       .orderBy('createdAt', 'desc')
-      .limit(limit)
-      .get();
+      .limit(limit).get();
 
     return reply.send({
       success: true,
@@ -268,26 +222,14 @@ module.exports = async (fastify) => {
     const matchDoc = await db.collection('matches').doc(matchId).get();
 
     if (!matchDoc.exists) {
-      return reply.code(404).send({
-        success:   false,
-        error:     'Match not found',
-        requestId: req.id,
-      });
+      return reply.code(404).send({ success: false, error: 'Match not found', requestId: req.id });
     }
 
     const match = matchDoc.data();
-
     if (match.buyerId !== uid && match.sellerId !== uid) {
-      return reply.code(403).send({
-        success:   false,
-        error:     'Unauthorized',
-        requestId: req.id,
-      });
+      return reply.code(403).send({ success: false, error: 'Unauthorized', requestId: req.id });
     }
 
-    return reply.send({
-      success: true,
-      match:   { id: matchDoc.id, ...match },
-    });
+    return reply.send({ success: true, match: { id: matchDoc.id, ...match } });
   });
 };

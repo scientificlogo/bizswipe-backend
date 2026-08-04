@@ -54,6 +54,20 @@ const set = async (key, value, ttl = TTL.LISTINGS_FEED) => {
   }
 };
 
+// ── Atomic reserve (SET NX EX) ────────────────────────────────────────────────
+// Returns true if this caller won the key, false if it already existed.
+// Returns null when Redis is unavailable so callers can decide how to degrade.
+const setNX = async (key, value, ttl) => {
+  if (!redis) return null;
+  try {
+    const result = await redis.set(key, value, { nx: true, ex: ttl });
+    return result === 'OK';
+  } catch (err) {
+    console.error('Cache SETNX error:', err.message);
+    return null; // Unknown — caller decides (idempotency fails open)
+  }
+};
+
 // ── Delete single key ─────────────────────────────────────────────────────────
 const del = async (key) => {
   if (!redis) return;
@@ -89,4 +103,4 @@ const ping = async () => {
   }
 };
 
-module.exports = { get, set, del, delPattern, ping, keys, TTL };
+module.exports = { get, set, setNX, del, delPattern, ping, keys, TTL };
