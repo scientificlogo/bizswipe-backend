@@ -86,6 +86,22 @@ const sendNotification = {
   },
 };
 
+// Relay: the client picks a template and a recipient, never a title/body.
+const relayNotification = {
+  body: {
+    type:     'object',
+    required: ['toUserId', 'type'],
+    additionalProperties: false,
+    properties: {
+      toUserId:  { type: 'string', minLength: 1, maxLength: 128 },
+      type:      { type: 'string', enum: ['interest', 'match', 'message'] },
+      matchId:   { type: 'string', maxLength: 128 },
+      listingId: { type: 'string', maxLength: 128 },
+      preview:   { type: 'string', maxLength: 200 },
+    },
+  },
+};
+
 // ── Admin ─────────────────────────────────────────────────────────────────────
 const rejectListing = {
   body: {
@@ -114,6 +130,7 @@ module.exports = {
   sendMessage,
   savePushToken,
   sendNotification,
+  relayNotification,
   rejectListing,
   banUser,
 };
