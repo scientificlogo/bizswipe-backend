@@ -1,116 +1,75 @@
 'use strict';
 
-const Bull = require('bull');
+// ── Push notifications and audit logging ──────────────────────────────────────
+//
+// This file used to put both on Bull queues. Nothing ever consumed them:
+// workers/index.js was a stub that logged "Workers ready" and registered no
+// processor, so every job sat in Redis forever while the producer reported
+// success. That had not bitten yet only because the app wrote matches itself —
+// the moment accepting an interest went through POST /api/matches/accept, its
+// "It's a Match!" push would have gone into that queue and stayed there.
+//
+// Writing the missing processors was tried twice and took the entire API down
+// both times with a 502 restart loop. Producing against this Redis is fine —
+// `new Bull(...)` and `add()` have run in production for months — but calling
+// `process()` on the same connection kills the node process in a way a
+// try/catch around the call does not catch. Upstash does not support the
+// blocking consumer Bull needs, and the second attempt ruled out the obvious
+// unhandled-'error'-event explanation.
+//
+// So the queue is gone rather than half-working. Both functions do directly
+// what their fallback path already did whenever Redis was unconfigured — code
+// that has been exercised in every local run since it was written. What is
+// given up is Bull's retry with exponential backoff; a push that fails now is
+// logged and dropped, which is what the interest and message pushes have
+// always done. Delivery beats a retry policy on jobs nobody runs.
+//
+// If retries are wanted later, the fix is a queue with a consumer that works
+// on this Redis, not a consumer bolted back onto this one.
 
-// ── Parse Upstash Redis URL for Bull (needs TLS) ──────────────────────────────
-const parseRedisUrl = (url) => {
-  try {
-    const parsed = new URL(url);
-    return {
-      host:     parsed.hostname,
-      port:     parseInt(parsed.port) || 6379,
-      password: parsed.password || parsed.username,
-      tls:      { rejectUnauthorized: false }, // Required for Upstash
-    };
-  } catch {
-    return null;
-  }
-};
+const { db }         = require('../config/firebase');
+const { FieldValue } = require('firebase-admin/firestore');
+const { notifyUser } = require('./pushNotification');
 
-const redisConfig = parseRedisUrl(process.env.UPSTASH_REDIS_URL || '');
-
-// ── Queue Options ──────────────────────────────────────────────────────────────
-const queueOptions = redisConfig ? {
-  redis: redisConfig,
-  defaultJobOptions: {
-    attempts:          3,    // Retry 3 times on failure
-    backoff: {
-      type:  'exponential',
-      delay: 2000,           // 2s, 4s, 8s
-    },
-    removeOnComplete: 100,   // Keep last 100 completed jobs
-    removeOnFail:     50,    // Keep last 50 failed jobs
-    timeout:          30000, // 30 second timeout per job
-  },
-} : null;
-
-// ── Queues ─────────────────────────────────────────────────────────────────────
-let notificationQueue = null;
-let auditQueue        = null;
-
-if (queueOptions) {
-  try {
-    // Push notification queue
-    notificationQueue = new Bull('notifications', queueOptions);
-
-    // Admin audit log queue
-    auditQueue = new Bull('audit-logs', queueOptions);
-
-    console.log('✅ Bull queues initialized');
-  } catch (err) {
-    console.error('❌ Bull queue init failed:', err.message);
-  }
-} else {
-  console.warn('⚠️  Bull queues disabled — no Redis config');
-}
-
-// ── Job Types ──────────────────────────────────────────────────────────────────
+// Kept so the shape of a job is still named in one place, and so anything
+// still importing JOB does not break.
 const JOB = {
-  SEND_PUSH:    'send_push',
-  SEND_BATCH:   'send_batch_push',
-  AUDIT_LOG:    'audit_log',
+  SEND_PUSH:  'send_push',
+  SEND_BATCH: 'send_batch_push',
+  AUDIT_LOG:  'audit_log',
 };
 
-// ── Add push notification job ─────────────────────────────────────────────────
+// ── Send a push notification ─────────────────────────────────────────────────
+// Returns immediately. The caller is a request handler and must not wait on
+// Expo — a slow push should never slow down accepting an interest.
 const addPushJob = async (userId, title, body, data = {}) => {
-  if (!notificationQueue) {
-    // Fallback: fire and forget without queue
-    const { notifyUser } = require('./pushNotification');
-    const { db } = require('../config/firebase');
-    setImmediate(() => notifyUser(db, userId, title, body, data).catch(() => {}));
-    return;
-  }
-  try {
-    await notificationQueue.add(JOB.SEND_PUSH, {
-      userId, title, body, data,
-      addedAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error('Failed to add push job:', err.message);
-    // Fallback
-    const { notifyUser } = require('./pushNotification');
-    const { db } = require('../config/firebase');
-    setImmediate(() => notifyUser(db, userId, title, body, data).catch(() => {}));
-  }
+  if (!userId || !title) return;
+  setImmediate(() => {
+    notifyUser(db, userId, title, body, data).catch(err =>
+      console.error('Push failed:', userId, err.message));
+  });
 };
 
-// ── Add audit log job ─────────────────────────────────────────────────────────
+// ── Write an admin audit row ─────────────────────────────────────────────────
 const addAuditLog = async (adminId, action, targetId, targetType, details = {}) => {
-  if (!auditQueue) {
-    // Fallback: write directly
-    const { db }         = require('../config/firebase');
-    const { FieldValue } = require('firebase-admin/firestore');
-    setImmediate(() => {
-      db.collection('adminActions').add({
-        adminId, action, targetId, targetType, details,
-        createdAt: FieldValue.serverTimestamp(),
-      }).catch(() => {});
-    });
-    return;
-  }
-  try {
-    await auditQueue.add(JOB.AUDIT_LOG, {
-      adminId, action, targetId, targetType, details,
-      addedAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    console.error('Failed to add audit job:', err.message);
-  }
+  if (!adminId || !action) return;
+  setImmediate(() => {
+    db.collection('adminActions').add({
+      adminId,
+      action,
+      targetId:   targetId   || null,
+      targetType: targetType || null,
+      details:    details    || {},
+      createdAt:  FieldValue.serverTimestamp(),
+    }).catch(err => console.error('Audit write failed:', action, err.message));
+  });
 };
 
 module.exports = {
-  notificationQueue,
-  auditQueue,
+  // Both were exported when they were Bull instances. Nothing outside this
+  // file ever used them, and there are no queues now.
+  notificationQueue: null,
+  auditQueue:        null,
   addPushJob,
   addAuditLog,
   JOB,
