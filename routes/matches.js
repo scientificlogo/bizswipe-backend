@@ -29,6 +29,18 @@ const declineSchema = {
   },
 };
 
+// The match for a (buyer, seller, listing) triple, or null. Used on the paths
+// where the interest was already processed, so the caller still gets an id to
+// open the chat with.
+const findMatch = async (buyerId, sellerId, listingId) => {
+  const snap = await db.collection('matches')
+    .where('buyerId',   '==', buyerId)
+    .where('sellerId',  '==', sellerId)
+    .where('listingId', '==', listingId)
+    .limit(1).get();
+  return snap.empty ? null : snap.docs[0].id;
+};
+
 module.exports = async (fastify) => {
 
   // ── Accept Interest → Atomic Transaction ──────────────────────────────────
@@ -55,8 +67,17 @@ module.exports = async (fastify) => {
       return reply.code(403).send({ success: false, error: 'Only the seller can accept', requestId: req.id });
     }
 
+    // Already-accepted has to hand back the match id, not just a message: the
+    // seller's next tap needs somewhere to navigate, and the client used to
+    // find that match by querying Firestore itself.
     if (interest.status !== 'pending') {
-      return reply.send({ success: true, message: 'Already processed', status: interest.status });
+      const existing = await findMatch(interest.buyerId, uid, interest.listingId);
+      return reply.send({
+        success: true,
+        message: 'Already processed',
+        status:  interest.status,
+        matchId: existing,
+      });
     }
 
     const [sellerDoc, listingDoc] = await Promise.all([
@@ -122,7 +143,10 @@ module.exports = async (fastify) => {
 
     } catch (err) {
       if (err instanceof ConflictError) {
-        return reply.send({ success: true, message: err.message });
+        // Two accepts raced. The winner created the match; hand its id back so
+        // the loser opens the same chat instead of a dead end.
+        const existing = await findMatch(interest.buyerId, uid, interest.listingId);
+        return reply.send({ success: true, message: err.message, matchId: existing });
       }
       req.log.error({ err, interestId, uid, requestId: req.id }, 'Transaction failed');
       return reply.code(500).send({ success: false, error: 'Could not create match — try again', requestId: req.id });
