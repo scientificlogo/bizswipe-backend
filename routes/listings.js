@@ -53,6 +53,13 @@ module.exports = async (fastify) => {
 
     const docRef = await db.collection('listings').add(listing);
 
+    // ProfileScreen's completeness meter checks users/{uid}.hasListing, which
+    // nothing ever wrote — so a seller with a live listing was permanently
+    // stuck at 80% with "Listing created" unticked.
+    // set/merge, not update: verifyToken does not require a user document to
+    // exist, and update() would throw NOT_FOUND after the listing was written.
+    await db.collection('users').doc(uid).set({ hasListing: true }, { merge: true });
+
     // Invalidate feed cache
     setImmediate(() => cache.delPattern('feed:*'));
 
@@ -245,6 +252,7 @@ module.exports = async (fastify) => {
     if (!doc.exists) return reply.code(404).send({ success: false, error: 'Listing not found', requestId: req.id });
     if (doc.data().sellerId !== uid) return reply.code(403).send({ success: false, error: 'Unauthorized', requestId: req.id });
     await db.collection('listings').doc(listingId).update({ status: 'inactive', deactivatedAt: FieldValue.serverTimestamp() });
+    await db.collection('users').doc(uid).set({ hasListing: false }, { merge: true });
     setImmediate(() => cache.delPattern('feed:*'));
     req.log.info({ event: 'listing_deactivated', userId: uid, listingId, requestId: req.id }, 'Listing deactivated');
     return reply.send({ success: true, message: 'Listing deactivated' });
