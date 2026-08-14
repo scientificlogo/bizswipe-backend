@@ -57,16 +57,6 @@ module.exports = async (fastify) => {
       rssMB:       Math.round(mem.rss       / 1024 / 1024),
     };
 
-    // Queues — a `waiting` count that only climbs means jobs are being added
-    // and never consumed, which is exactly how the "It's a Match!" push went
-    // missing for as long as workers/index.js was a stub.
-    try {
-      const { workerStatus } = require('../workers');
-      checks.queues = await workerStatus();
-    } catch (err) {
-      checks.queues = { status: 'error', error: err.message };
-    }
-
     // Uptime
     checks.uptime = {
       status:  'ok',
