@@ -1,6 +1,7 @@
 const { verifyToken } = require('../middleware/auth');
 const { db }          = require('../config/firebase');
 const { FieldValue }  = require('firebase-admin/firestore');
+const cache           = require('../utils/cache');
 
 // Per-user swipe rate limiter (max 50 swipes per minute)
 const swipeMap = new Map();
@@ -100,6 +101,11 @@ module.exports = async (fastify) => {
         }
       }
     }
+
+    // The feed's first page is cached per user for five minutes and the swiped
+    // listing is filtered out at build time — without this the card the buyer
+    // just swiped comes straight back on the next fetch.
+    setImmediate(() => cache.delPattern(`feed:${uid}:*`));
 
     return reply.send({ success:true, direction, interestId });
   });
