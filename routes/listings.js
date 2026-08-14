@@ -114,19 +114,33 @@ module.exports = async (fastify) => {
       }
     }
 
-    const swipedSnap = await db.collection('swipes').where('buyerId', '==', uid).get();
+    // Blocks were applied on the phone, which only worked because the client
+    // could see every listing's sellerId. The feed no longer ships sellerId at
+    // all, so the filter has to happen here.
+    const [swipedSnap, blockedSnap] = await Promise.all([
+      db.collection('swipes').where('buyerId',  '==', uid).get(),
+      db.collection('blocks').where('blockerId', '==', uid).get(),
+    ]);
     const swipedIds  = swipedSnap.docs.map(d => d.data().listingId);
+    const blockedIds = new Set(blockedSnap.docs.map(d => d.data().blockedUserId).filter(Boolean));
+
+    const fetchSize = limit + swipedIds.length + blockedIds.size + 1;
 
     let q = db.collection('listings')
       .where('status', '==', 'active')
       .orderBy('createdAt', 'desc')
-      .limit(limit + swipedIds.length + 1);
+      .limit(fetchSize);
 
     if (lastDoc) q = q.startAfter(lastDoc);
 
-    const snap     = await q.get();
-    const listings = snap.docs
-      .filter(d => !swipedIds.includes(d.id) && d.data().sellerId !== uid)
+    const snap    = await q.get();
+    const visible = snap.docs.filter(d =>
+      !swipedIds.includes(d.id) &&
+      d.data().sellerId !== uid &&
+      !blockedIds.has(d.data().sellerId)
+    );
+
+    const listings = visible
       .slice(0, limit)
       .map(d => ({
         id:           d.id,
@@ -135,6 +149,10 @@ module.exports = async (fastify) => {
         bannerColor:  d.data().bannerColor,
         accentColor:  d.data().accentColor,
         location:     d.data().location,
+        // The buyer's saved preferences match on state, and the seller types
+        // it as its own field — without it every location preference silently
+        // fell back to substring-matching the free-text location line.
+        state:        d.data().state,
         type:         d.data().type,
         age:          d.data().age,
         employees:    d.data().employees,
@@ -147,11 +165,20 @@ module.exports = async (fastify) => {
         views:        d.data().views,
       }));
 
+    // Cursor off the last *fetched* doc, not the last returned one, whenever
+    // the window was filled. A page where everything was swiped or blocked
+    // returns zero listings — anchoring the cursor to the returned list would
+    // hand back null and strand the client on an empty feed with more to see.
+    const filledWindow = snap.docs.length === fetchSize;
+    const nextCursor   = listings.length === limit
+      ? listings[listings.length - 1].id
+      : (filledWindow ? snap.docs[snap.docs.length - 1].id : null);
+
     const response = {
       success:    true,
       listings,
-      hasMore:    snap.docs.length > limit,
-      nextCursor: listings.length > 0 ? listings[listings.length - 1].id : null,
+      hasMore:    visible.length > limit || filledWindow,
+      nextCursor,
       source:     'firestore',
     };
 
@@ -177,12 +204,40 @@ module.exports = async (fastify) => {
     },
   }, async (req, reply) => {
     const { listingId } = req.params;
+    const { uid }       = req.user;
+
     const doc = await db.collection('listings').doc(listingId).get();
     if (!doc.exists) {
       return reply.code(404).send({ success: false, error: 'Listing not found', requestId: req.id });
     }
+    const listing = doc.data();
+
+    // A seller looking at their own listing is not a view.
+    if (listing.sellerId === uid) return reply.send({ success: true, counted: false });
+
+    // The de-duplication and the listingViews document used to live in
+    // SwipeScreen, which needed the listing's sellerId to write them — the one
+    // field the feed exists to withhold. Without the dedupe here the counter
+    // would climb every time a card scrolled back into view.
+    const seen = await db.collection('listingViews')
+      .where('listingId', '==', listingId)
+      .where('viewerId',  '==', uid)
+      .limit(1).get();
+
+    if (!seen.empty) return reply.send({ success: true, counted: false });
+
+    const viewerDoc = await db.collection('users').doc(uid).get();
+
+    await db.collection('listingViews').add({
+      listingId,
+      sellerId:   listing.sellerId,
+      viewerId:   uid,
+      viewerName: viewerDoc.data()?.name || 'Buyer',
+      viewedAt:   FieldValue.serverTimestamp(),
+    });
     await db.collection('listings').doc(listingId).update({ views: FieldValue.increment(1) });
-    return reply.send({ success: true });
+
+    return reply.send({ success: true, counted: true });
   });
 
   // ── Get seller's listing ──────────────────────────────────────────────────
