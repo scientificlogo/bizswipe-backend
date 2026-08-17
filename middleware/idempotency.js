@@ -91,11 +91,20 @@ const idempotency = async (req, reply) => {
   reply.send = (payload) => {
     const statusCode = reply.statusCode || 200;
 
-    if (statusCode >= 500) {
-      // Server-side failure — let the client retry the same key.
-      cache.del(key).catch(() => {});
-    } else {
+    // Only a completed write is worth replaying. Everything else releases the
+    // key so the client can legitimately try again.
+    //
+    // This used to record any status below 500 for a full day, which turned a
+    // transient refusal into a permanent one: the rate limiter's 429 runs
+    // through this same reply.send, so a seller who hit "5 listings an hour"
+    // had that 429 replayed at them for the next 24 hours every time they
+    // submitted the same form. Both protected routes re-check for a duplicate
+    // themselves, so releasing the key on an error cannot let a double write
+    // through.
+    if (statusCode >= 200 && statusCode < 300) {
       cache.set(key, { statusCode, payload }, TTL_SECONDS).catch(() => {});
+    } else {
+      cache.del(key).catch(() => {});
     }
 
     return originalSend(payload);

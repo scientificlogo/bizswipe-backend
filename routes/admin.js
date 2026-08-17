@@ -255,6 +255,85 @@ module.exports = async (fastify) => {
     return reply.send({ success: true, message: 'User unbanned' });
   });
 
+  // ── GST manual review queue ────────────────────────────────────────────────
+  // Fills when POST /api/verify/gst/pending accepts someone whose GSTIN could
+  // not be checked because the verification vendor was down. Without somewhere
+  // to action it, "we will verify shortly" would be a promise nothing keeps —
+  // the same fiction the listing approval queue used to be.
+  //
+  // No orderBy, deliberately: a single equality filter needs no composite index,
+  // so this works on a fresh project with nothing deployed but the rules.
+  fastify.get('/gst/pending', { preHandler: verifyAdmin }, async (req, reply) => {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+    const snap  = await db.collection('users')
+      .where('gstPending', '==', true).limit(limit).get();
+
+    return reply.send({
+      success: true,
+      count:   snap.docs.length,
+      users:   snap.docs.map(d => ({
+        id:          d.id,
+        name:        d.data().name,
+        phone:       d.data().phone,
+        role:        d.data().role,
+        gstNumber:   d.data().gstNumber,
+        submittedAt: d.data().gstSubmittedAt,
+      })),
+    });
+  });
+
+  fastify.post('/gst/:userId/resolve', {
+    preHandler: verifyAdmin,
+    schema: {
+      body: {
+        type: 'object',
+        required: ['approved'],
+        additionalProperties: false,
+        properties: {
+          approved:     { type: 'boolean' },
+          businessName: { type: 'string', maxLength: 200 },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const { userId } = req.params;
+    const { approved, businessName } = req.body;
+
+    const userDoc = await db.collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      return reply.code(404).send({ success: false, error: 'User not found', requestId: req.id });
+    }
+
+    await db.collection('users').doc(userId).set({
+      gstVerified:   approved,
+      gstPending:    false,
+      gstVerifiedAt: approved ? FieldValue.serverTimestamp() : null,
+      ...(approved && businessName ? { gstBusinessName: businessName } : {}),
+    }, { merge: true });
+
+    req.log.info({
+      event:     approved ? 'gst_manually_approved' : 'gst_manually_rejected',
+      adminId:   req.user.uid,
+      userId,
+      requestId: req.id,
+    }, 'GST review resolved');
+
+    addAuditLog(req.user.uid, approved ? 'gst_approved' : 'gst_rejected', userId, 'user', {
+      gstNumber: userDoc.data().gstNumber,
+    });
+
+    addPushJob(
+      userId,
+      approved ? 'GST Verified ✅' : 'GST Verification Failed',
+      approved
+        ? 'Your GST number has been verified. You are all set.'
+        : 'We could not verify your GST number. Please re-enter it in your profile.',
+      { type: 'gst_review' }
+    );
+
+    return reply.send({ success: true });
+  });
+
   // ── Get all users ──────────────────────────────────────────────────────────
   fastify.get('/users', { preHandler: verifyAdmin }, async (req, reply) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);

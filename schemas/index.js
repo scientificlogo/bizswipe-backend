@@ -24,6 +24,22 @@ const verifyGST = {
   },
 };
 
+// Same shape as verifyGST — a GSTIN going into the manual review queue is held
+// to exactly the format the live check demands.
+const submitGST = {
+  body: {
+    type: 'object',
+    required: ['gstin'],
+    additionalProperties: false,
+    properties: {
+      gstin: {
+        type:    'string',
+        pattern: '^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[A-Z][0-9A-Z]{1}$',
+      },
+    },
+  },
+};
+
 // ── Listings ──────────────────────────────────────────────────────────────────
 const createListing = {
   body: {
@@ -126,6 +142,7 @@ const banUser = {
 module.exports = {
   pagination,
   verifyGST,
+  submitGST,
   createListing,
   sendMessage,
   savePushToken,

@@ -1,8 +1,31 @@
 'use strict';
 
 const { verifyToken }  = require('../middleware/auth');
-const { verifyGST: verifyGSTSchema } = require('../schemas');
+const { db }           = require('../config/firebase');
+const { FieldValue }   = require('firebase-admin/firestore');
+const { verifyGST: verifyGSTSchema, submitGST: submitGSTSchema } = require('../schemas');
 const cache = require('../utils/cache');
+
+// ── Record the verification on the user ───────────────────────────────────────
+// GSTScreen used to write gstVerified straight into users/{uid} itself, which
+// meant the phone decided whether the phone was verified — anyone could set the
+// flag without ever holding a GST number. The result of the check belongs to the
+// side that made the check, so it is written here and the field is server-only
+// in firestore.rules.
+//
+// set/merge rather than update: verifyToken does not require the user document
+// to exist, and update() throws NOT_FOUND on a user who somehow reaches this
+// screen without one.
+const markVerified = async (uid, gstin, result) => {
+  await db.collection('users').doc(uid).set({
+    gstNumber:       gstin,
+    gstVerified:     true,
+    gstPending:      false,
+    gstBusinessName: result.businessName,
+    gstState:        result.state,
+    gstVerifiedAt:   FieldValue.serverTimestamp(),
+  }, { merge: true });
+};
 
 const RAPIDAPI_KEY  = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST;
@@ -45,6 +68,7 @@ module.exports = async (fastify) => {
     // Test mode — instant response
     if (TEST_GSTIN[gstin]) {
       req.log.info({ event:'gst_test_mode', gstin, requestId:req.id }, 'GST test mode response');
+      await markVerified(req.user.uid, gstin, TEST_GSTIN[gstin]);
       return reply.send({ success: true, ...TEST_GSTIN[gstin] });
     }
 
@@ -58,6 +82,7 @@ module.exports = async (fastify) => {
         duration:  Date.now() - start,
         requestId: req.id,
       }, 'GST served from cache');
+      await markVerified(req.user.uid, gstin, cachedData);
       return reply.send({ ...cachedData, fromCache: true });
     }
 
@@ -90,9 +115,13 @@ module.exports = async (fastify) => {
         }, 'GST API returned error');
 
         return reply.code(422).send({
-          success:   false,
-          error:     'GST number not found or invalid',
-          requestId: req.id,
+          success:    false,
+          code:       'GST_NOT_FOUND',
+          // The number itself is wrong, so there is nothing to fall back to —
+          // letting this through would put a junk GSTIN into the review queue.
+          canProceed: false,
+          error:      'GST number not found or invalid',
+          requestId:  req.id,
         });
       }
 
@@ -107,6 +136,8 @@ module.exports = async (fastify) => {
 
       // Fix #2 — Cache result for 24 hours (GST data is static)
       setImmediate(() => cache.set(cacheKey, result, cache.TTL.GST_VERIFY));
+
+      await markVerified(req.user.uid, gstin, result);
 
       req.log.info({
         event:     'gst_verify_success',
@@ -131,13 +162,69 @@ module.exports = async (fastify) => {
         requestId: req.id,
       }, isTimeout ? 'GST API timed out' : 'GST API call failed');
 
+      // canProceed is the whole point of this branch. GST is a hard gate on
+      // onboarding for buyers and sellers alike and there is no skip, so when
+      // this one third-party API is down or out of quota, nobody at all can
+      // finish signing up — a launch day could be lost to a vendor outage the
+      // platform has no control over. The client is told it may offer the
+      // review queue below instead of a dead end.
       return reply.code(503).send({
-        success:   false,
-        error:     isTimeout
+        success:    false,
+        code:       isTimeout ? 'VERIFICATION_TIMEOUT' : 'VERIFICATION_UNAVAILABLE',
+        canProceed: true,
+        error:      isTimeout
           ? 'GST verification timed out — please try again'
           : 'GST verification service unavailable — try again',
-        requestId: req.id,
+        requestId:  req.id,
       });
     }
+  });
+
+  // ── Submit a GSTIN for manual review ──────────────────────────────────────
+  // Only reachable when /gst answered canProceed — the user gets into the app
+  // with gstVerified false and gstPending true, and an admin clears the queue
+  // through GET /api/admin/gst/pending. The GSTIN is format-checked by the same
+  // schema as the live route, so the queue cannot fill with junk.
+  fastify.post('/gst/pending', {
+    preHandler: verifyToken,
+    schema:     submitGSTSchema,
+    config: {
+      rateLimit: {
+        max:          5,
+        timeWindow:   '1 hour',
+        keyGenerator: (req) => `gstpending_${req.user?.uid || req.ip}`,
+      },
+    },
+  }, async (req, reply) => {
+    const { gstin } = req.body;
+    const { uid }   = req.user;
+
+    const userDoc = await db.collection('users').doc(uid).get();
+
+    // An already-verified user has nothing to queue, and this must never be a
+    // route back out of a real verification.
+    if (userDoc.data()?.gstVerified === true) {
+      return reply.send({ success: true, alreadyVerified: true });
+    }
+
+    await db.collection('users').doc(uid).set({
+      gstNumber:      gstin,
+      gstVerified:    false,
+      gstPending:     true,
+      gstSubmittedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+
+    req.log.warn({
+      event:     'gst_queued_for_review',
+      userId:    uid,
+      gstin,
+      requestId: req.id,
+    }, 'GST queued for manual review — verification API was unavailable');
+
+    return reply.send({
+      success: true,
+      pending: true,
+      message: 'We could not reach the GST service. Your number is saved and will be verified shortly.',
+    });
   });
 };

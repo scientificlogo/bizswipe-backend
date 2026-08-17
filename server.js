@@ -87,11 +87,31 @@ fastify.register(require('@fastify/cors'), {
 
 fastify.register(require('@fastify/helmet'), { contentSecurityPolicy: false });
 
+// Rate limiting runs on preHandler, NOT the plugin's default onRequest hook.
+// onRequest fires before verifyToken, so req.user was always undefined and every
+// keyGenerator in this codebase fell through to its IP branch — including
+// `view_${req.user?.uid}_${listingId}`, which became the literal string
+// "view_undefined_<id>" and capped a popular listing at ten views a minute
+// across all users at once. On preHandler the limiter is appended after the
+// route's own preHandler array, so verifyToken has already set req.user.
+//
+// Route-level `config.rateLimit` objects are merged onto these globals, so they
+// inherit the hook without each route repeating it.
+//
+// The key is the uid for anything authenticated, which is every route that
+// matters. The fallback is clientAddress(), not the raw X-Forwarded-For the old
+// key read: with trustProxy on, a caller can prepend their own entry to that
+// header and reset any counter keyed on it — including req.ip, which resolves to
+// the leftmost entry. clientAddress takes the last one, which only our own edge
+// can write.
+const { clientAddress } = require('./middleware/ipGuard');
+
 fastify.register(require('@fastify/rate-limit'), {
   global:     true,
-  max:        100,
+  hook:       'preHandler',
+  max:        200,
   timeWindow: '1 minute',
-  keyGenerator: (req) => req.user?.uid || req.headers['x-forwarded-for'] || req.ip,
+  keyGenerator: (req) => req.user?.uid || clientAddress(req),
   errorResponseBuilder: (req) => ({
     success:    false,
     error:      'Too many requests — please try again in 1 minute',
@@ -99,6 +119,10 @@ fastify.register(require('@fastify/rate-limit'), {
     statusCode: 429,
   }),
 });
+
+// Unauthenticated traffic never reaches the limiter above (verifyToken rejects
+// it first), so this counts raw requests per address ahead of everything else.
+fastify.addHook('onRequest', require('./middleware/ipGuard').ipGuard);
 
 // ── 5. Request ID in every response ──────────────────────────────────────────
 fastify.addHook('onSend', async (request, reply) => {

@@ -199,7 +199,9 @@ module.exports = async (fastify) => {
       rateLimit: {
         max:          10,
         timeWindow:   '1 minute',
-        keyGenerator: (req) => `view_${req.user?.uid}_${req.params.listingId}`,
+        // The `|| req.ip` matters: without it an unauthenticated request keyed
+        // every caller onto the single bucket "view_undefined_<listingId>".
+        keyGenerator: (req) => `view_${req.user?.uid || req.ip}_${req.params.listingId}`,
       },
     },
   }, async (req, reply) => {
@@ -271,9 +273,53 @@ module.exports = async (fastify) => {
         .where('buyerId', '==', uid).where('listingId', '==', listingId).limit(1).get();
       isMatched = !matchSnap.empty;
     }
+
+    // Blanking businessName out of a `...data` spread was not enough: sellerName,
+    // sellerPhone and sellerId rode along in the same spread. Every listing id is
+    // handed to every buyer by the feed, so anyone could walk those ids and
+    // collect the phone number of every seller on the platform — the whole point
+    // of masking the business name, undone one field over.
+    //
+    // Allow-list, not deny-list, and the same field set the feed sends. A field
+    // added to a listing tomorrow is invisible here until someone decides it is
+    // safe, which is the right default.
+    const publicListing = {
+      id:           doc.id,
+      industry:     data.industry,
+      emoji:        data.emoji,
+      bannerColor:  data.bannerColor,
+      accentColor:  data.accentColor,
+      location:     data.location,
+      state:        data.state,
+      type:         data.type,
+      age:          data.age,
+      employees:    data.employees,
+      turnover:     data.turnover,
+      askingPrice:  data.askingPrice,
+      profitStatus: data.profitStatus,
+      hasDebt:      data.hasDebt,
+      tags:         data.tags,
+      interested:   data.interested,
+      views:        data.views,
+      status:       data.status,
+    };
+
+    // description and reason are free text the seller types — they routinely
+    // name the business — so they are held back with the identity fields.
+    const identity = {
+      businessName: data.businessName,
+      sellerName:   data.sellerName,
+      sellerPhone:  data.sellerPhone,
+      sellerId:     data.sellerId,
+      description:  data.description,
+      reason:       data.reason,
+      debtAmount:   data.debtAmount,
+      createdAt:    data.createdAt,
+    };
+
     return reply.send({
       success: true,
-      listing: { id: doc.id, ...data, businessName: (isOwner || isMatched) ? data.businessName : undefined },
+      listing: (isOwner || isMatched) ? { ...publicListing, ...identity } : publicListing,
     });
   });
 
